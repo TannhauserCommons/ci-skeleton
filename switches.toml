@@ -1,0 +1,14 @@
+# The one list of feature switches (docs/context/contract.md, "switches.py").
+# Off must be exactly today's app. A one-line commit flips `default`.
+
+cap_per_area = 2 # proposed; the owner has not decided the cap
+tombstones = []
+
+[[switch]]
+name = "shout"
+what = "The fixture greets in capitals"
+owner = "owner"
+area = "cli"
+default = "off"
+ready = false
+expires = "0.3.0"

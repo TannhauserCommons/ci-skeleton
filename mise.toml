@@ -1,0 +1,46 @@
+# Tool pins (rule 10) and this repo's own tasks. The fixture in fixture/ stands
+# in for a real project: it fills in the task contract so the skeleton's own CI
+# proves the workflows, the gate and the shared scripts end to end.
+
+[tools]
+python = "3.14.10"
+actionlint = "1.7.12"
+
+[task_config]
+includes = [".github/ci/tasks.toml"]
+
+[tasks.check]
+description = "Everything a PR must pass that gives the same answer every time"
+run = ["python -m unittest discover -s tests/ci -t .", "python fixture/tasks/check.py"]
+
+[tasks.budgets]
+description = "Exact metrics against fixture/budgets.toml"
+run = "python fixture/tasks/budgets.py"
+
+[tasks.looks]
+description = "looks <base>: key screens on the base and the change, each twice, exact"
+run = "python fixture/tasks/looks.py"
+
+[tasks.build]
+description = "Build this runner's target, unsigned, into dist/"
+run = "python fixture/tasks/build.py"
+
+[tasks.smoke]
+description = "Install test on the files in dist/"
+run = "python fixture/tasks/smoke.py"
+
+[tasks.compare]
+description = "compare <base>: time the base against the change, same machine"
+run = "python fixture/tasks/compare.py"
+
+[tasks.publish]
+description = "Sign the files in dist/ and check the signatures"
+run = "python fixture/tasks/publish.py"
+
+[tasks.version]
+description = "Print the version main carries"
+run = "python fixture/tasks/version.py"
+
+[tasks.bump]
+description = "bump <version>: write the version"
+run = "python fixture/tasks/version.py"
