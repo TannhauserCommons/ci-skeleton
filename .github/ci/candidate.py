@@ -23,7 +23,7 @@ MARKER = "<!-- ci:candidate -->"
 # Files of the release dir that are never release files: the manifests are handled apart,
 # the notes become the body.
 CANDIDATE_JSON = "candidate.json"  # what record built: name -> hash before signing
-SIGNED_JSON = "signed.json"  # what publish uploaded: name -> hash after signing
+SIGNED_JSON = "signed.json"  # what publish uploaded: name -> every hash it signed to, over all attempts
 NOT_ASSETS = (CANDIDATE_JSON, SIGNED_JSON, "NOTES.md")
 # GitHub rewrites asset names it dislikes (spaces become dots, ...), which would break
 # the name -> hash map, so record refuses names it would not keep as they are.
@@ -52,6 +52,20 @@ def git_ok(*args):
     """Whether a git command exits 0. For yes/no questions (`merge-base --is-ancestor`),
     so a "no" is never mistaken for an error by parsing its text."""
     return subprocess.run(["git", *args], capture_output=True).returncode == 0
+
+
+def require_bump_key():
+    """Refuse unless the job has the deploy key for the bump.
+
+    A push with the workflow's own token starts no workflow; the deploy key's push
+    does, and that builds the next candidate. `fetch` asks first, so a missing key
+    stops the release before anything irreversible, the tag, has happened.
+    """
+    if os.environ.get("BUMP_KEY_SET") != "true":
+        raise CandidateError(
+            "BUMP_KEY is not set: the bump is pushed with a deploy key so that it starts main "
+            '(README, "Copy it into a project")'
+        )
 
 
 def mise_version():
@@ -354,7 +368,12 @@ def cmd_record(args):
 
 
 def read_signed(root, candidate_sha):
-    """`(signed, problems)`: the parsed `signed.json` (None when absent) and what is wrong with it."""
+    """`(signed, problems)`: `signed.json` normalised to `{"sha", "files": {name: [hash, ...]}}`.
+
+    `signed` is None when the file is absent or unusable. A plain string for a name
+    (the earlier shape) counts as a one-item list. A signer that is not
+    byte-deterministic gives a new hash on every attempt, so the lists grow.
+    """
     path = root / SIGNED_JSON
     if not path.is_file():
         return None, []
@@ -369,7 +388,14 @@ def read_signed(root, candidate_sha):
             f"{SIGNED_JSON} sha {str(signed.get('sha'))[:7]} differs from {CANDIDATE_JSON} "
             f"{candidate_sha[:7]}"
         ]
-    return signed, []
+    files = {}
+    for name, hashes in signed["files"].items():
+        if isinstance(hashes, str):
+            hashes = [hashes]
+        if not isinstance(hashes, list) or not all(isinstance(h, str) for h in hashes):
+            return None, [f"{SIGNED_JSON} is malformed: {name}"]
+        files[name] = hashes
+    return {"sha": signed["sha"], "files": files}, []
 
 
 def verify_candidate(directory, draft):
@@ -401,13 +427,13 @@ def verify_candidate(directory, draft):
         file = root / name
         if not file.is_file():
             problems.append(f"missing file: {name}")
-        elif sha256(file) != listed[name] and sha256(file) != signed_files.get(name):
+        elif sha256(file) != listed[name] and sha256(file) not in signed_files.get(name, []):
             problems.append(f"hash differs: {name}")
     for name in sorted(present - set(listed)):
         file = root / name
         if name not in signed_files:
             problems.append(f"unlisted file: {name}")
-        elif sha256(file) != signed_files[name]:
+        elif sha256(file) not in signed_files[name]:
             problems.append(f"hash differs: {name}")
     if manifest["sha"] != draft.get("target_commitish"):
         problems.append(
@@ -431,12 +457,14 @@ def resume_published():
     """
     version = mise_version()
     tag = f"v{version}"
-    released = any(
-        r.get("tag_name") == tag and not r.get("draft") for r in all_releases()
+    published = next(
+        (r for r in all_releases() if r.get("tag_name") == tag and not r.get("draft")), None
     )
-    if not released or not tag_exists(tag):
+    if published is None or not tag_exists(tag):
         raise CandidateError("no candidate: main has not been green since the last release")
     print(f"release: {tag} is already published; only the bump is left")
+    # The job may have died right after the publish, before this cleanup; nothing else retries it.
+    drop_manifests(published["id"], tag)
     ghapi.output("published", "true")
     ghapi.output("sha", tag_commit(tag))
     ghapi.output("version", version)
@@ -454,6 +482,7 @@ def cmd_fetch(args):
 
     Always sets the output `published`: `true` only on the resume path.
     """
+    require_bump_key()  # before any GitHub call
     draft = standing_draft()
     if draft is None:
         return resume_published()
@@ -484,9 +513,7 @@ def cmd_fetch(args):
             )
         dist.mkdir(parents=True, exist_ok=True)
         for entry in sorted(scratch.iterdir()):
-            # signed.json described an earlier attempt; the next publish writes a fresh one.
-            if entry.name != SIGNED_JSON:
-                shutil.move(str(entry), str(dist / entry.name))
+            shutil.move(str(entry), str(dist / entry.name))
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     ghapi.output("published", "false")
@@ -519,6 +546,11 @@ def cmd_publish(args):
     if not files:
         raise CandidateError(f"no release files in {args.dir}")
 
+    # Earlier attempts' hashes stay valid: a signer that is not byte-deterministic leaves
+    # files from attempt 1 on the draft that match neither candidate.json nor attempt 2.
+    earlier, problems = read_signed(Path(args.dir), sha)
+    if problems:
+        raise CandidateError("; ".join(problems))
     names = ", ".join(f.name for f in files)
     if args.dry_run:
         print(f"dry run: would upload {SIGNED_JSON}, then {len(files)} files to {tag}: {names}")
@@ -530,7 +562,12 @@ def cmd_publish(args):
     # draft then holds files in two states, and `fetch` can only tell which are
     # legitimate (signed) from the hashes this manifest recorded.
     signed_path = Path(args.dir) / SIGNED_JSON
-    signed = {"sha": sha, "files": {f.name: sha256(f) for f in files}}
+    hashes = {name: list(old) for name, old in (earlier or {"files": {}})["files"].items()}
+    for f in files:
+        now = sha256(f)
+        if now not in hashes.setdefault(f.name, []):
+            hashes[f.name].append(now)
+    signed = {"sha": sha, "files": dict(sorted(hashes.items()))}
     signed_path.write_text(json.dumps(signed, indent=2) + "\n", encoding="utf-8")
     ghapi.gh("release", "upload", draft["tag_name"], str(signed_path), "--clobber")
     ghapi.gh("release", "upload", draft["tag_name"], *[str(f) for f in files], "--clobber")
@@ -571,13 +608,8 @@ def cmd_bump(args):
     """Move `main` to the version after the one just released."""
     released = args.released.removeprefix("v")
     nxt = next_patch(released)
-    if not args.dry_run and os.environ.get("BUMP_KEY_SET") != "true":
-        # A push with the workflow's own token starts no workflow; the deploy key's
-        # push does, and that is what builds the next candidate.
-        raise CandidateError(
-            "BUMP_KEY is not set: the bump is pushed with a deploy key so that it starts main "
-            '(README, "Copy it into a project")'
-        )
+    if not args.dry_run:
+        require_bump_key()  # fetch asked already; this is the step that needs the key
     if args.dry_run:
         # Read the tree as it is: a dry run must not touch the checkout.
         carried = mise_version()
