@@ -91,6 +91,19 @@ jobs:
       - name: mise run ci:switches
         run: mise run ci:switches
 
+  hang:
+    needs: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          version: 2026.10.23
+          cache_save: false
+      - name: mise run hang
+        run: mise run hang
+
   lint:
     needs: changes
     if: ${{ contains(fromJSON(needs.changes.outputs.run), 'lint') }}
@@ -146,7 +159,7 @@ jobs:
   # skipped only when the path map left it out.
   gate:
     if: ${{ !cancelled() }}
-    needs: [changes, test, switches, lint, budgets, looks] # PROJECT: every job above
+    needs: [changes, test, switches, hang, lint, budgets, looks] # PROJECT: every job above
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

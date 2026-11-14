@@ -44,3 +44,7 @@ run = "python fixture/tasks/version.py"
 [tasks.bump]
 description = "bump <version>: write the version"
 run = "python fixture/tasks/version.py"
+
+[tasks.hang]
+description = "Proof only: never returns"
+run = "python fixture/tasks/hang.py"
