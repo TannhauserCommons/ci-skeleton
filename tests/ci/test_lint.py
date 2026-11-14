@@ -46,6 +46,8 @@ jobs:
         with:
           fetch-depth: 0
       - uses: "jdx/mise-action@{SHA}"
+        with:
+          cache_save: ${{{{ github.ref == 'refs/heads/main' }}}}
       - name: mise run check
         run: mise run check
       - run: mise run looks ${{{{ github.event.pull_request.base.sha || github.event.before }}}}
@@ -236,20 +238,20 @@ class NameTest(unittest.TestCase):
 
 class PullRequestTargetTest(unittest.TestCase):
     def test_key_is_a_finding(self):
-        text = "on:\n  pull_request_target:\n    branches: [main]\npermissions: {}\njobs: {}\n"
+        text = "on:\n  pull_request_target:\n    branches: [main]\npermissions: {contents: read}\njobs: {}\n"
         self.assertEqual(findings(text), [(2, "pull_request_target is not allowed")])
 
     def test_list_item_and_inline_forms_are_findings(self):
         for on in ("on: [push, pull_request_target]", "on:\n  - pull_request_target", "on: pull_request_target"):
             with self.subTest(on=on):
-                self.assertEqual(messages(f"{on}\npermissions: {{}}\n"), ["pull_request_target is not allowed"])
+                self.assertEqual(messages(f"{on}\npermissions: {{contents: read}}\n"), ["pull_request_target is not allowed"])
 
     def test_comment_is_not_a_finding(self):
-        text = "on:\n  pull_request: # never pull_request_target here\n# pull_request_target\npermissions: {}\n"
+        text = "on:\n  pull_request: # never pull_request_target here\n# pull_request_target\npermissions: {contents: read}\n"
         self.assertEqual(findings(text), [])
 
     def test_in_quotes_with_hash_before_is_still_a_finding(self):
-        text = "on: pull_request\npermissions: {}\nenv:\n  X: 'a # pull_request_target'\n"
+        text = "on: pull_request\npermissions: {contents: read}\nenv:\n  X: 'a # pull_request_target'\n"
         self.assertEqual(messages(text), ["pull_request_target is not allowed"])
 
 
@@ -262,11 +264,180 @@ class PermissionsTest(unittest.TestCase):
         text = job("      - uses: ./x\n").replace("    steps:", "    permissions:\n      contents: read\n    steps:")
         self.assertEqual(messages("on: push\njobs:\n" + text), ["no top-level permissions:"])
 
-    def test_empty_permissions_is_fine(self):
-        self.assertEqual(findings("on: push\npermissions: {}\n"), [])
+    def test_contents_read_is_fine_in_block_and_inline_form(self):
+        for permissions in (
+            "permissions:\n  contents: read\n",
+            "permissions: # least\n  contents: read # only\n\njobs: {}\n",
+            "permissions: {contents: read}\n",
+            "permissions: { contents: read }\n",
+        ):
+            with self.subTest(permissions=permissions):
+                self.assertEqual(findings("on: push\n" + permissions), [])
+
+    def test_anything_but_contents_read_is_a_finding_on_the_permissions_line(self):
+        for permissions in (
+            "permissions: write-all\n",
+            "permissions: read-all\n",
+            "permissions: {}\n",
+            "permissions:\n  contents: write\n",
+            "permissions:\n  contents: read\n  issues: write\n",
+            "permissions:\n  issues: read\n",
+            "permissions: {contents: read, pull-requests: write}\n",
+            "permissions: {contents: write}\n",
+            "permissions:\n",
+        ):
+            with self.subTest(permissions=permissions):
+                self.assertEqual(
+                    findings("on: push\n" + permissions),
+                    [(2, "top-level permissions must be exactly `contents: read`")],
+                )
+
+    def test_job_level_permissions_are_not_held_to_it(self):
+        text = job("      - uses: ./x\n").replace("    steps:", "    permissions:\n      issues: write\n    steps:")
+        self.assertEqual(findings(workflow(text)), [])
 
     def test_commented_permissions_does_not_count(self):
         self.assertEqual(messages("on: push\n# permissions:\n"), ["no top-level permissions:"])
+
+
+class MiseActionTest(unittest.TestCase):
+    MESSAGE = "jdx/mise-action must set cache_save (only main saves caches)"
+
+    def steps(self, body, ref=f"jdx/mise-action@{SHA}"):
+        return workflow(job(f"      - uses: {ref}\n{body}"))
+
+    def test_no_with_is_a_finding_on_the_uses_line(self):
+        self.assertEqual(findings(self.steps("")), [(12, self.MESSAGE)])
+
+    def test_with_without_cache_save_is_a_finding(self):
+        text = self.steps("        with:\n          version: 2026.10.23\n")
+        self.assertEqual(findings(text), [(12, self.MESSAGE)])
+
+    def test_cache_save_false_or_expression_is_fine(self):
+        for value in ("false", "${{ github.ref == 'refs/heads/main' }}", "'false'"):
+            with self.subTest(value=value):
+                text = self.steps(f"        with:\n          version: 1\n          cache_save: {value}\n")
+                self.assertEqual(findings(text), [])
+
+    def test_cache_save_first_or_inline_is_fine(self):
+        self.assertEqual(findings(self.steps("        with:\n          cache_save: false\n")), [])
+        self.assertEqual(findings(self.steps("        with: {cache_save: false, version: 1}\n")), [])
+
+    def test_cache_save_on_the_next_step_does_not_count(self):
+        text = self.steps("        with:\n          version: 1\n") + (
+            f"      - uses: actions/checkout@{SHA}\n        with:\n          cache_save: false\n"
+        )
+        self.assertEqual(findings(text), [(12, self.MESSAGE)])
+
+    def test_cache_save_outside_with_does_not_count(self):
+        text = self.steps("        env:\n          cache_save: false\n")
+        self.assertEqual(findings(text), [(12, self.MESSAGE)])
+
+    def test_with_on_the_dash_line_order(self):
+        text = workflow(job(f"      - with:\n          cache_save: false\n        uses: jdx/mise-action@{SHA}\n"))
+        self.assertEqual(findings(text), [])
+
+    def test_other_actions_need_no_cache_save(self):
+        text = workflow(job(f"      - uses: actions/cache@{SHA}\n"))
+        self.assertEqual(findings(text), [])
+
+    def test_unpinned_mise_action_gets_both_findings(self):
+        text = self.steps("", ref="jdx/mise-action@v3")
+        self.assertEqual(len(findings(text)), 2)
+
+
+class RunExpressionTest(unittest.TestCase):
+    def run_line(self, command):
+        return workflow(job(f"      - name: mise run x\n        run: {command}\n"))
+
+    def reads(self, command):
+        return messages(self.run_line(command))
+
+    def test_trusted_contexts_are_fine(self):
+        for expression in (
+            "inputs.dry_run",
+            "inputs.all && '--all' || ''",
+            "steps.base.outputs.base",
+            "steps.my-step.outputs.sha-x",
+            "matrix.os",
+            "github.sha",
+            "github.run_id",
+            "github.event.before",
+            "github.event.pull_request.base.sha",
+            "github.event.workflow_run.id",
+            "github.event.pull_request.base.sha || github.event.before",
+            "!inputs.dry_run && (matrix.os == 'linux' || matrix.os != 'mac') && true",
+            "inputs.x == null || false",
+        ):
+            with self.subTest(expression=expression):
+                self.assertEqual(self.reads(f"mise run x ${{{{ {expression} }}}}"), [])
+
+    def test_untrusted_contexts_are_findings_naming_the_context(self):
+        for context in (
+            "github.head_ref",
+            "github.event.pull_request.title",
+            "github.ref_name",
+            "github.actor",
+            "env.X",
+            "secrets.TOKEN",
+            "needs.build.outputs.y",
+            "github.event.pull_request.base.ref",
+            "inputs.x.y",
+            "matrix",
+        ):
+            with self.subTest(context=context):
+                self.assertEqual(
+                    self.reads(f"mise run x ${{{{ {context} }}}}"),
+                    [f"run: reads ${{{{ {context} }}}}; pass it through env instead"],
+                )
+
+    def test_finding_is_on_the_run_line(self):
+        self.assertEqual(
+            findings(self.run_line("mise run x ${{ github.head_ref }}")),
+            [(13, "run: reads ${{ github.head_ref }}; pass it through env instead")],
+        )
+
+    def test_function_calls_are_findings(self):
+        self.assertEqual(
+            self.reads("mise run x ${{ contains(inputs.a, 'b') }}"),
+            ["run: reads ${{ contains() }}; pass it through env instead"],
+        )
+        self.assertEqual(len(self.reads("mise run x ${{ format('{0}', inputs.a) }}")), 1)
+
+    def test_one_finding_per_untrusted_context_even_when_mixed(self):
+        text = "mise run x ${{ github.head_ref }} ${{ inputs.ok }} ${{ github.ref_name || github.head_ref }}"
+        self.assertEqual(
+            self.reads(text),
+            [
+                "run: reads ${{ github.head_ref }}; pass it through env instead",
+                "run: reads ${{ github.ref_name }}; pass it through env instead",
+            ],
+        )
+
+    def test_string_literals_are_not_contexts(self):
+        self.assertEqual(self.reads("mise run x ${{ inputs.a && 'github.head_ref' || 'it''s' }}"), [])
+
+    def test_block_scalar_run_is_checked_too(self):
+        text = workflow(job("      - name: mise run x\n        run: |\n          mise run x ${{ github.head_ref }}\n"))
+        self.assertEqual(messages(text), ["run: reads ${{ github.head_ref }}; pass it through env instead"])
+
+    def test_non_mise_run_with_untrusted_expression_gets_both_findings(self):
+        self.assertEqual(
+            self.reads("echo ${{ github.head_ref }}"),
+            ["run is not a single `mise run ...` line", "run: reads ${{ github.head_ref }}; pass it through env instead"],
+        )
+
+    def test_with_env_and_if_are_not_checked(self):
+        steps = (
+            "      - name: mise run x\n        if: github.head_ref == 'x'\n"
+            "        run: mise run x\n        env:\n          REF: ${{ github.head_ref }}\n"
+            f"      - uses: org/a@{SHA}\n        with:\n          ref: ${{{{ github.head_ref }}}}\n"
+        )
+        self.assertEqual(findings(workflow(job(steps))), [])
+
+    def test_chaining_inside_an_expression_still_is_not_chaining(self):
+        self.assertEqual(self.reads("mise run x ${{ inputs.a && 'a' || 'b' }}"), [])
+        self.assertEqual(self.reads("mise run x && echo ${{ inputs.a }}"), ["run is not a single `mise run ...` line"])
 
 
 class FilesTest(unittest.TestCase):
