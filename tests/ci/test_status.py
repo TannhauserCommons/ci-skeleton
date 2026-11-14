@@ -22,9 +22,9 @@ def stamp(minutes_ago):
     return (NOW - timedelta(minutes=minutes_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def pr(number, title="Change", sha=None, pushed=10):
+def pr(number, title="Change", sha=None, pushed=10, draft=False):
     return {"number": number, "title": title, "head": {"sha": sha or f"{number:x}" * 40},
-            "updated_at": stamp(pushed)}
+            "updated_at": stamp(pushed), "draft": draft}
 
 
 def check(conclusion, started=5, name="gate", state="completed"):
@@ -150,17 +150,42 @@ class StatusTests(unittest.TestCase):
         fake = FakeGitHub([p], {p["head"]["sha"]: [check(None, state="queued")]})
         self.assertEqual(self.lines(fake), ["main: green", "candidate: none"])
 
-    def test_green_gate_is_not_reported_however_old(self):
-        p = pr(16, pushed=5000)
+    def test_green_pr_waits_for_the_owner_however_old(self):
+        for pushed in (10, 5000):
+            with self.subTest(pushed=pushed):
+                p = pr(16, "Ready", pushed=pushed)
+                fake = FakeGitHub([p], {p["head"]["sha"]: [check("success")]})
+                self.assertEqual(self.lines(fake), [
+                    "main: green", "pr #16: green, waiting for the owner  Ready", "candidate: none"])
+
+    def test_green_draft_pr_prints_nothing(self):
+        p = pr(18, draft=True)
         fake = FakeGitHub([p], {p["head"]["sha"]: [check("success")]})
         self.assertEqual(self.lines(fake), ["main: green", "candidate: none"])
+
+    def test_red_draft_pr_is_still_reported(self):
+        p = pr(19, draft=True)
+        fake = FakeGitHub([p], {p["head"]["sha"]: [check("failure")]})
+        self.assertIn("pr #19: gate failed  Change", self.lines(fake))
+
+    def test_pr_lines_order_failed_then_stuck_then_green(self):
+        green, stuck, red = pr(1, "G"), pr(2, "S", pushed=200), pr(3, "R")
+        fake = FakeGitHub([green, stuck, red], {green["head"]["sha"]: [check("success")],
+                                                red["head"]["sha"]: [check("failure")]})
+        prs = [l for l in self.lines(fake) if l.startswith("pr #")]
+        self.assertEqual(prs, [
+            "pr #3: gate failed  R",
+            "pr #2: stuck  gate missing for 3h 20m  S",
+            "pr #1: green, waiting for the owner  G",
+        ])
 
     def test_newest_gate_run_wins_and_other_checks_are_ignored(self):
         p = pr(17, pushed=500)
         runs = [check("failure", started=200), check("success", started=20),
                 check("failure", started=1, name="lint")]
         fake = FakeGitHub([p], {p["head"]["sha"]: runs})
-        self.assertEqual(self.lines(fake), ["main: green", "candidate: none"])
+        self.assertEqual([l for l in self.lines(fake) if l.startswith("pr #")],
+                         ["pr #17: green, waiting for the owner  Change"])
 
     def test_failed_prs_come_before_stuck_prs(self):
         stuck, red = pr(1, pushed=200), pr(2)

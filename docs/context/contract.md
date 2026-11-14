@@ -135,7 +135,7 @@ The candidate lives on the **standing release draft**: the one draft release who
 
 ### `status.py`
 
-`python .github/ci/status.py`. Prints, in this order and only the lines that apply: `main: red` with the issue link, or with the newest finished `main` run when that did not succeed (a startup failure never reaches `after`), else `main: green`, each open PR whose `gate` check failed, each open PR whose `gate` is not green more than an hour after its last push, the candidate (`candidate: v<version> <short sha>`, or `candidate: none`), and the number of open `flaky` issues. Exits 0 always: it reports, it does not gate.
+`python .github/ci/status.py`. Prints, in this order and only the lines that apply: `main: red` with the issue link, or with the newest finished `main` run when that did not succeed (a startup failure never reaches `after`), else `main: green`, each open PR whose `gate` check failed, each open PR whose `gate` is not green more than an hour after its last push, each open PR that is green and waiting for the person who approves merges (drafts excepted), the candidate (`candidate: v<version> <short sha>`, or `candidate: none`), and the number of open `flaky` issues. Exits 0 always: it reports, it does not gate.
 
 ### `ghapi.py`
 

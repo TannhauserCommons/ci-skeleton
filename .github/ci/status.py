@@ -71,26 +71,34 @@ def gate_run(sha):
 
 
 def pr_lines(now):
-    """One line per open PR whose gate failed, then one per PR whose gate is stuck.
+    """One line per open PR that needs someone: failed, then stuck, then green.
+
+    Every PR merges only on the owner's yes, nothing auto-merges, so a green PR
+    waits on a person. Listing it keeps none sitting unnoticed. The order puts
+    what an agent must act on first. A green draft is not waiting for the
+    owner, so it prints nothing.
 
     A failed gate is reported as failed only, not again as stuck. The push time
     is the PR's `updated_at`: the pulls list has no push time, and asking each
     commit for one costs a call per PR. A comment or label bumps `updated_at`,
     so this can only under-report stuck PRs, never invent one.
     """
-    red, stuck = [], []
+    red, stuck, waiting = [], [], []
     for pr in ghapi.api("pulls?state=open&per_page=100", paginate=True) or []:
         gate = gate_run(pr["head"]["sha"])
         conclusion = gate.get("conclusion") if gate else None
         title = clean(pr["title"])
         if conclusion in GATE_FAILED:
             red.append(f"pr #{pr['number']}: gate failed  {title}")
-        elif conclusion != "success":
+        elif conclusion == "success":
+            if not pr.get("draft"):
+                waiting.append(f"pr #{pr['number']}: green, waiting for the owner  {title}")
+        else:
             idle = (now - parse_time(pr["updated_at"])).total_seconds()
             if idle > STUCK_AFTER_SECONDS:
                 state = "missing" if gate is None else (conclusion or gate.get("status") or "unknown")
                 stuck.append(f"pr #{pr['number']}: stuck  gate {state} for {age_text(idle)}  {title}")
-    return red + stuck
+    return red + stuck + waiting
 
 
 def candidate_line():
