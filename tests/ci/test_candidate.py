@@ -118,7 +118,9 @@ class Base(unittest.TestCase):
         env = mock.patch.dict(os.environ, {}, clear=False)
         env.start()
         self.addCleanup(env.stop)
-        for key in ("GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_OUTPUT"):
+        # The caller's settings must not change what the tests see.
+        for key in ("GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_OUTPUT",
+                    "CI_BRANCH", "CI_REPO", "RELEASE_NOTES"):
             os.environ.pop(key, None)
         os.environ["BUMP_KEY_SET"] = "true"  # the workflow sets it for the whole release job
         self.is_ancestor = True
