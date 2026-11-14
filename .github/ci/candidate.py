@@ -476,23 +476,25 @@ def verify_candidate(directory, draft):
     return problems, manifest
 
 
-def resume_published():
-    """Report a release that published but did not finish, or fail with "no candidate".
+def resume_published(version, releases):
+    """Finish the report of a release that published but did not finish; None when this is no resume.
 
-    With no draft, the version `main` carries is still the released one only
-    when the bump never landed. Then only the bump is left, and its inputs are
-    read from the published release instead of a download.
+    The version the checked-out tree carries decides, not what drafts exist: a rerun
+    checks out the same commit as the original run, so while the bump has not
+    landed the tree still carries the released version. A new candidate draft that
+    appeared meanwhile must not be released by a rerun that only finishes the old
+    release. Then only the bump is left, and its inputs are read from the
+    published release instead of a download.
     """
-    version = mise_version()
     tag = f"v{version}"
     published = next(
-        (r for r in all_releases() if r.get("tag_name") == tag and not r.get("draft")), None
+        (r for r in releases if r.get("tag_name") == tag and not r.get("draft")), None
     )
     if published is None or not tag_exists(tag):
-        raise CandidateError(f"no candidate: {branch()} has not been green since the last release")
+        return None
     print(f"release: {tag} is already published; only the bump is left")
     # The job may have died right after the publish, before this cleanup; nothing else retries it.
-    drop_manifests(published["id"], tag)
+    drop_manifests(published["id"], tag, dry_run=bool(os.environ.get("DRY_RUN")))
     ghapi.output("published", "true")
     ghapi.output("sha", tag_commit(tag))
     ghapi.output("version", version)
@@ -511,9 +513,14 @@ def cmd_fetch(args):
     Always sets the output `published`: `true` only on the resume path.
     """
     require_bump_key(required=False)  # before any GitHub call; absent means no bump step
-    draft = standing_draft()
+    version = mise_version()  # the tree's own version, before any release is looked at
+    releases = all_releases()
+    resumed = resume_published(version, releases)
+    if resumed is not None:
+        return resumed
+    draft = standing_draft(releases)
     if draft is None:
-        return resume_published()
+        raise CandidateError(f"no candidate: {branch()} has not been green since the last release")
     tree = Path(args.tree)
     scratch = Path(tempfile.mkdtemp(prefix="candidate-"))
     try:
@@ -613,15 +620,19 @@ def cmd_publish(args):
     return 0
 
 
-def drop_manifests(release_id, tag):
+def drop_manifests(release_id, tag, dry_run=False):
     """Delete the manifests from the published release: they describe the candidate, not the release.
 
     The release is out by now, so a failure here warns and never fails the step.
+    A dry run only says what it would remove.
     """
     try:
-        for asset in draft_assets(release_id):
-            if asset["name"] in (CANDIDATE_JSON, SIGNED_JSON):
-                ghapi.api(f"releases/assets/{asset['id']}", "DELETE")
+        found = [a for a in draft_assets(release_id) if a["name"] in (CANDIDATE_JSON, SIGNED_JSON)]
+        if found and dry_run:
+            print(f"dry run: would remove the manifests from {tag}")
+            return
+        for asset in found:
+            ghapi.api(f"releases/assets/{asset['id']}", "DELETE")
     except RuntimeError as err:
         print(f"::warning title=Manifests left on {tag}::could not delete {CANDIDATE_JSON} and {SIGNED_JSON}: {err}")
 
