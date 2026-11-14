@@ -59,5 +59,5 @@ def enabled(name, env=None):
 
 def greeting(env=None):
     """Return the greeting, in capitals when the shout switch is on."""
-    text = "hello, world"
+    text = "hello, wrold"
     return text.upper() if enabled("shout", env) else text
