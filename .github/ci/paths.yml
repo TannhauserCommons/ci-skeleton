@@ -1,0 +1,11 @@
+# The path map: one key per path-gated job id in check.yml. A job whose key is
+# absent here always runs. PRs run a gated job only when its paths changed;
+# main runs them all.
+
+lint:
+  - '.github/**'
+  - 'mise.toml'
+budgets:
+  - 'fixture/**'
+looks:
+  - 'fixture/**'

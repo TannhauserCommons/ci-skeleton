@@ -1,0 +1,155 @@
+name: check
+
+# Every PR; main.yml calls it with `all: true` on every push to main.
+# The one required status is `gate` (shown as "check / gate").
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_call:
+    inputs:
+      all:
+        description: Run every job, whatever paths changed
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# A newer push cancels the older run of the same PR. Cancelled is neither red
+# nor green.
+concurrency:
+  group: check-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  # Always runs, so the required status never hangs in Pending. Decides which
+  # path-gated jobs run and which of them the gate may see skipped.
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run: ${{ steps.select.outputs.run }}
+      skippable: ${{ steps.select.outputs.skippable }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          version: 2026.10.23
+          cache_save: ${{ github.ref == 'refs/heads/main' }}
+      - id: filter
+        if: ${{ !inputs.all }}
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: .github/ci/paths.yml
+      - id: select
+        name: mise run ci:select
+        run: mise run ci:select ${{ inputs.all && '--all' || '' }}
+        env:
+          CHANGES: ${{ steps.filter.outputs.changes }}
+
+  # PROJECT: the job list. Each job is checkout, mise, one `mise run <task>`.
+  # A path-gated job has a key in .github/ci/paths.yml and this `if:`; any
+  # other job always runs. Every job id goes in the gate's `needs:`.
+
+  test:
+    needs: changes
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          version: 2026.10.23
+          cache_save: ${{ github.ref == 'refs/heads/main' }}
+      - name: mise run check
+        run: mise run check
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: flakes-test-${{ matrix.os }}
+          path: flakes/
+          if-no-files-found: ignore
+          retention-days: 3
+
+  switches:
+    needs: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          version: 2026.10.23
+          cache_save: ${{ github.ref == 'refs/heads/main' }}
+      - name: mise run ci:switches
+        run: mise run ci:switches
+
+  lint:
+    needs: changes
+    if: ${{ contains(fromJSON(needs.changes.outputs.run), 'lint') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          version: 2026.10.23
+          cache_save: ${{ github.ref == 'refs/heads/main' }}
+      - name: mise run ci:lint
+        run: mise run ci:lint
+
+  budgets:
+    needs: changes
+    if: ${{ contains(fromJSON(needs.changes.outputs.run), 'budgets') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          version: 2026.10.23
+          cache_save: ${{ github.ref == 'refs/heads/main' }}
+      - name: mise run budgets
+        run: mise run budgets
+
+  # The base is the commit the change is measured against: the PR's base on a
+  # PR, the previous head of main on a push, the parent on a dispatched run.
+  looks:
+    needs: changes
+    if: ${{ contains(fromJSON(needs.changes.outputs.run), 'looks') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          version: 2026.10.23
+          cache_save: ${{ github.ref == 'refs/heads/main' }}
+      - name: mise run looks
+        run: mise run looks ${{ github.event.pull_request.base.sha || github.event.before || 'HEAD~1' }}
+        env:
+          VISUAL_CHANGE: ${{ contains(github.event.pull_request.labels.*.name, 'visual-change') && '1' || '' }}
+
+  # The only required status. `!cancelled()` makes it run when a job it needs
+  # failed (a plain `needs:` job would be skipped, and skipped counts as
+  # passing). It fails on any failed or cancelled job, and lets a job be
+  # skipped only when the path map left it out.
+  gate:
+    if: ${{ !cancelled() }}
+    needs: [changes, test, switches, lint, budgets, looks] # PROJECT: every job above
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
+        with:
+          jobs: ${{ toJSON(needs) }}
+          allowed-skips: ${{ needs.changes.outputs.skippable }}
