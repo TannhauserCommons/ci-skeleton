@@ -35,9 +35,24 @@ def age_text(seconds):
 
 
 def main_line():
-    """`main: red  <issue url>` while a `main-red` issue is open, else `main: green`."""
+    """`main: red  <where to look>` or `main: green`.
+
+    Red while a `main-red` issue is open, and also when the newest finished
+    `main` run did not succeed: a run that fails at startup (a broken workflow
+    file) never reaches `after`, so no issue exists for it.
+    """
     issue = ghapi.find_issue("main-red")
-    return f"main: red  {issue['html_url']}" if issue else "main: green"
+    if issue:
+        return f"main: red  {issue['html_url']}"
+    runs = ghapi.api("actions/workflows/main.yml/runs?branch=main&status=completed&per_page=10")
+    for run in (runs or {}).get("workflow_runs", []):
+        # Cancelled is neither red nor green: the run before it still stands.
+        if run.get("conclusion") in ("cancelled", "skipped"):
+            continue
+        if run.get("conclusion") != "success":
+            return f"main: red  {run['conclusion']}  {run['html_url']}"
+        break
+    return "main: green"
 
 
 def gate_run(sha):
