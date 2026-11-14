@@ -59,7 +59,6 @@ class ShoutOn(unittest.TestCase):
         self.assertEqual(run_cli(flags="shout"), "HELLO, WORLD")
 
 
-@unittest.skipUnless(os.environ.get("FIXTURE_FLAKE") == "1", "set FIXTURE_FLAKE=1")
 class Flaky(unittest.TestCase):
     def test_passes_on_retry(self):
         # Why: check.py sets FIXTURE_RETRY=1 for its one retry run, so the first
