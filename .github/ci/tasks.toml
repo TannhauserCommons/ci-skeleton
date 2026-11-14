@@ -30,7 +30,7 @@ description = "Green main: put dist/ on the standing release draft as the candid
 run = "python .github/ci/candidate.py record"
 
 ["ci:fetch"]
-description = "Release: download the candidate into dist/ and check every hash"
+description = "Release: check every hash, put the candidate in candidate/ and its files in candidate/dist"
 run = "python .github/ci/candidate.py fetch"
 
 ["ci:publish"]

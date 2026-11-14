@@ -2,12 +2,9 @@ name: main
 
 # Every push to main: everything check runs, on the merged result, then the
 # release candidate. Blocks nothing; after.yml opens the issue when it is red.
-# A release dispatches it for its bump commit, which a push by the workflow
-# token does not start.
 on:
   push:
     branches: [main]
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -42,6 +39,7 @@ jobs:
       - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
           version: 2026.10.23
+          cache_save: ${{ github.ref == 'refs/heads/main' }}
       - name: mise run build
         run: mise run build
       - name: mise run smoke
@@ -68,6 +66,7 @@ jobs:
       - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
           version: 2026.10.23
+          cache_save: ${{ github.ref == 'refs/heads/main' }}
       - id: base
         name: mise run ci:base
         run: mise run ci:base
@@ -91,7 +90,8 @@ jobs:
     permissions:
       contents: write
     # Shared with the release job, so a candidate is never replaced while a
-    # release is signing and publishing it.
+    # release is signing and publishing it. No other job may join this group:
+    # a third member could push a waiting release out of the queue.
     concurrency:
       group: candidate
       cancel-in-progress: false
@@ -102,6 +102,7 @@ jobs:
       - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
           version: 2026.10.23
+          cache_save: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: dist-*

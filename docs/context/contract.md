@@ -26,7 +26,7 @@ Every CI step is `mise run <task>`. A step's `name:` is exactly `mise run <task>
 | `build` | `main` | Build this runner's release target, unsigned, into `dist/` | Non-zero on failure |
 | `smoke` | `main` | Install and update tests on the files in `dist/` | Non-zero on failure |
 | `compare <base>` | `main` | Time `<base>` against the change, interleaved, same machine, with a base-against-base noise floor; write the table to `dist/NOTES.md` | Non-zero only past the noise floor |
-| `publish` | `release` | Sign the files in `dist/`, check the signatures, deploy to production. Must be safe to run twice. `DRY_RUN=1` signs and checks but deploys nothing | Non-zero on failure |
+| `publish` | `release` | Sign the files in `dist/`, check the signatures, deploy to production. Runs in the candidate's own tree. Must be safe to run twice, also on files it already signed. `DRY_RUN=1` signs and checks but deploys nothing | Non-zero on failure |
 | `version` | `main`, `release` | Print the version `main` carries (the next release), as the last line of stdout | |
 | `bump <version>` | `release` | Write `<version>` into every file that holds the version | |
 
@@ -50,7 +50,7 @@ A job that ran tests uploads the folder `flakes/` as an artifact named `flakes-<
 | `ci:after` | `after.py` | After a `check` or `main` run: one infra rerun, flake issues, the red-`main` issue |
 | `ci:base` | `candidate.py base` | Prints the last commit `main` tested green |
 | `ci:candidate` | `candidate.py record` | Green `main`: puts `dist/` on the standing release draft as the candidate |
-| `ci:fetch` | `candidate.py fetch` | Release: downloads the candidate into `dist/` and checks every hash |
+| `ci:fetch` | `candidate.py fetch` | Release: checks every hash, then puts the candidate's commit in `candidate/` and its files in `candidate/dist` |
 | `ci:publish` | `candidate.py publish` | Release: uploads the signed files, publishes the draft (which creates the tag, last), files switch-removal issues |
 | `ci:bump` | `candidate.py bump` | Release: moves `main` to the next version |
 
@@ -68,11 +68,13 @@ All scripts are Python 3.11+ standard library only, run from the repo root, and 
 
 `python .github/ci/lint.py [files...]` (default: `.github/workflows/*.yml`). Fails, one line per finding as `file:line: message`, on:
 - a `uses:` that is not a 40-hex SHA pin (local `./` paths are fine);
+- a top-level `permissions:` that is anything but `contents: read`;
+- a `jdx/mise-action` step that does not set `cache_save` (only `main` saves caches);
+- an expression in a `run:` line that reads anything but `inputs`, `steps.*.outputs`, `matrix`, and a few fixed `github` values (untrusted text must go through `env`);
 - a job without `timeout-minutes` (jobs that are only `uses: ./...` are exempt);
 - a `run:` whose command is not a single `mise run ...` line;
 - a `run:` step whose `name:` is not exactly `mise run <task>`;
-- `pull_request_target` anywhere;
-- no top-level `permissions:`.
+- `pull_request_target` anywhere.
 
 ### `switches.py`
 
@@ -104,7 +106,7 @@ expires = "0.3.0"         # a release (x.y.z) or a date (YYYY-MM-DD)
 1. Conclusion `cancelled` or `skipped`: do nothing (cancelled is neither red nor green).
 2. Conclusion `failure` and `run_attempt == 1`: if **every** failed job is an infra failure, rerun the failed jobs once and stop. A failed job is infra when its first failed step comes before the job's first step named `mise run ...`, or when no step is recorded as failed (a lost runner). The `gate` job is left out: it fails because another job did. Never by log text.
 3. Flakes (any conclusion): download the run's `flakes-*` artifacts, and for each flaky test open or comment on one issue titled `flaky: <test id>` (label `flaky`). At most 10 new issues per run.
-4. Workflow `main` on `main` only (a push, or the dispatch a release sends for its bump commit): on failure open or update the one issue labelled `main-red`, naming the commit range since the last green `main` run, its commits and authors, the failed jobs and the run link; the rule is fix or revert, revert by default. On success close it with a comment.
+4. Workflow `main` only, and only when no later `main` run has finished since: on failure open or update the one issue labelled `main-red`, naming the commit range since the last green `main` run, its commits and authors, the failed jobs and the run link; the rule is fix or revert, revert by default. On success close it with a comment.
 
 Infra reruns are counted from run history: `check` and `main` runs with `run_attempt > 1`.
 
@@ -118,9 +120,9 @@ The candidate lives on the **standing release draft**: the one draft release who
 
 - `base`: outputs `base`, the `head_sha` of the newest successful `main` run on `main` (nothing when there is none).
 - `record [--dir dist]`: when the tag `v<version>` already exists the commit is not a candidate (it landed between a released commit and the release's bump): prints a notice and exits 0. Otherwise writes `candidate.json`, builds the notes (commits since the last release tag grouped by the area before the first `: ` of the subject, `switches.py notes`, then `dist/NOTES.md` if present, then the candidate's commit and the marker), creates or updates the draft (`tag_name` `v<version>`, `target_commitish` the commit), deletes its old assets with `candidate.json` first, uploads the new files with `candidate.json` last. `NOTES.md` is not uploaded. File names must be ones GitHub keeps as they are (letters, digits, `.`, `_`, `+`, `-`).
-- `fetch [--dir dist]`: downloads the draft's assets into an empty `dist/`, checks every hash against `candidate.json`, and fails on any mismatch, missing or extra file, or a manifest that disagrees with the draft. Outputs `published=false`, `sha`, `version`, `tag`. With no draft, when the version `main` carries is already published (a release that published and then failed), downloads nothing and outputs `published=true` with the same three values, so a rerun finishes the bump. With no draft and nothing published under that version: fails, there is no candidate.
-- `publish [--dir dist] [--dry-run]`: refuses if the draft no longer matches `dist/candidate.json` (a newer candidate replaced it). Uploads every file in `dist/` except `candidate.json` and `NOTES.md` to the draft (replacing same-named assets), runs `switches.py shipped`, then publishes the draft, which creates the tag at the candidate's commit. With no draft and the tag present it is already published: exits 0. `--dry-run` prints what it would do.
-- `bump --released <version> [--dry-run]`: on `origin/main`: if `mise run version` still equals the released version, runs `mise run bump <next patch>`, commits `Start v<next>`, pushes to `main` (three attempts if `main` moved) and dispatches `main.yml`, because a push by the workflow token starts no run; if `main` already carries another version, does nothing.
+- `fetch [--tree candidate]`: downloads the draft's assets, checks every hash against `candidate.json`, and fails on any mismatch, missing or extra file, a manifest that disagrees with the draft, or a commit that is not on `main`. Then puts the candidate's commit in `<tree>` (a git worktree) and its files in `<tree>/dist`. Outputs `published=false`, `sha`, `version`, `tag`. With no draft, when the version `main` carries is already published (a release that published and then failed), downloads nothing and outputs `published=true` with the same three values, so a rerun finishes the bump. With no draft and nothing published under that version: fails, there is no candidate.
+- `publish [--dir candidate/dist] [--dry-run]`: refuses if the draft no longer matches `candidate.json` (a newer candidate replaced it). Writes `signed.json` (the hash of every file as it is now, after signing) and uploads it first, then every file in the dir except the manifests and `NOTES.md` (replacing same-named assets), runs `switches.py shipped`, publishes the draft, which creates the tag at the candidate's commit, and last removes the two manifests from the release. A release that died between the first upload and the publish can be rerun: `fetch` accepts a file that matches either manifest. With no draft and the tag present it is already published: exits 0. `--dry-run` prints what it would do.
+- `bump --released <version> [--dry-run]`: on `origin/main`: if `mise run version` still equals the released version, runs `mise run bump <next patch>`, commits `Start v<next>` and pushes to `main` (three attempts if `main` moved); if `main` already carries another version, does nothing. The push must be made with a deploy key (the workflow's checkout sets it up from the secret `BUMP_KEY`; `bump` refuses without `BUMP_KEY_SET=true`): unlike a push by the workflow token it can pass a ruleset on `main`, and it starts the next `main` run.
 
 ### `status.py`
 

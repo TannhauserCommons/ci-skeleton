@@ -1,4 +1,5 @@
 dist/
+candidate/
 flakes/
 __pycache__/
 .base/

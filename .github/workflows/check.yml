@@ -120,7 +120,8 @@ jobs:
         run: mise run budgets
 
   # The base is the commit the change is measured against: the PR's base on a
-  # PR, the previous head of main on a push, the parent on a dispatched run.
+  # PR, the previous head of main on main. A visual change is judged in its
+  # PR; on main only an unstable screen fails.
   looks:
     needs: changes
     if: ${{ contains(fromJSON(needs.changes.outputs.run), 'looks') }}
@@ -135,9 +136,9 @@ jobs:
           version: 2026.10.23
           cache_save: ${{ github.ref == 'refs/heads/main' }}
       - name: mise run looks
-        run: mise run looks ${{ github.event.pull_request.base.sha || github.event.before || 'HEAD~1' }}
+        run: mise run looks ${{ github.event.pull_request.base.sha || github.event.before }}
         env:
-          VISUAL_CHANGE: ${{ contains(github.event.pull_request.labels.*.name, 'visual-change') && '1' || '' }}
+          VISUAL_CHANGE: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'visual-change')) && '1' || '' }}
 
   # The only required status. `!cancelled()` makes it run when a job it needs
   # failed (a plain `needs:` job would be skipped, and skipped counts as
