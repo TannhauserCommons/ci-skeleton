@@ -42,7 +42,7 @@ def infra_failure(name="check / mac"):
 
 def make_run(conclusion="failure", attempt=1, path=".github/workflows/main.yml", event="push"):
     return {
-        "id": RUN_ID, "name": "main", "path": path, "event": event, "head_branch": "main",
+        "id": RUN_ID, "name": "main", "path": path, "event": event,
         "conclusion": conclusion, "run_attempt": attempt, "head_sha": HEAD,
         "html_url": RUN_URL,
         "head_commit": {"message": "Fix it\n\nbody", "author": {"name": "Ann"}},
@@ -59,6 +59,7 @@ class FakeGitHub:
         self.issues = [dict(i) for i in issues]
         self.green = list(green)
         self.compare = compare
+        self.completed = []  # finished main runs, newest first; empty: this run is the newest
         self.writes = []  # (method, path, body)
         self.requested = []
 
@@ -77,6 +78,8 @@ class FakeGitHub:
             return [i for i in self.issues if label in i["labels"] and i["state"] == "open"]
         if path.startswith("labels"):
             return []
+        if path.startswith("actions/workflows/main.yml/runs?branch=main&status=completed"):
+            return {"workflow_runs": self.completed}
         if path.startswith("actions/workflows/main.yml/runs"):
             return {"workflow_runs": self.green}
         if path.startswith("compare/"):
@@ -440,17 +443,24 @@ class RedMainTests(AfterTestCase):
         self.run_after(fake)
         self.assertEqual(fake.opened(), [])
 
-    def test_dispatched_main_run_on_main_is_main_red(self):
-        fake = FakeGitHub(make_run("failure", event="workflow_dispatch"), jobs=[real_failure()])
-        self.run_after(fake)
-        self.assertEqual(len(fake.opened()), 1)
-
-    def test_dispatched_main_run_on_another_branch_is_not_main_red(self):
-        run = make_run("failure", event="workflow_dispatch")
-        run["head_branch"] = "try-it"
-        fake = FakeGitHub(run, jobs=[real_failure()])
+    def test_an_older_red_run_does_not_open_the_issue_after_a_newer_run_finished(self):
+        fake = FakeGitHub(make_run("failure"), jobs=[real_failure()])
+        fake.completed = [{"id": RUN_ID + 1, "conclusion": "success"}]
         self.run_after(fake)
         self.assertEqual(fake.opened(), [])
+
+    def test_a_rerun_of_an_older_green_run_does_not_close_the_issue(self):
+        fake = FakeGitHub(make_run("success"), issues=[open_issue(7, "main is red", "main-red")])
+        fake.completed = [{"id": RUN_ID + 1, "conclusion": "failure"}]
+        self.run_after(fake)
+        self.assertEqual(fake.writes, [])
+
+    def test_a_newer_cancelled_run_does_not_count_as_newer(self):
+        fake = FakeGitHub(make_run("failure"), jobs=[real_failure()])
+        fake.completed = [{"id": RUN_ID + 1, "conclusion": "cancelled"},
+                          {"id": RUN_ID, "conclusion": "failure"}]
+        self.run_after(fake)
+        self.assertEqual(len(fake.opened()), 1)
 
     def test_path_with_ref_suffix_still_identifies_the_workflow(self):
         run = make_run("failure", path=".github/workflows/main.yml@refs/heads/main")

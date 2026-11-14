@@ -309,12 +309,24 @@ def report_red(run, failed):
 
 
 def is_main_run(run):
-    """A `main` run that tested main: a push, or the dispatch a release's bump sends."""
-    return (
-        workflow_file(run) == "main.yml"
-        and run.get("event") in ("push", "workflow_dispatch")
-        and run.get("head_branch") == "main"
+    """A `main` run for a push to main."""
+    return workflow_file(run) == "main.yml" and run.get("event") == "push"
+
+
+def is_newest_main_run(run):
+    """Whether no later `main` run has finished since this one.
+
+    A rerun of an old run, or a slow `after`, must not reopen or close the
+    issue against what a newer run already said about main.
+    """
+    data = ghapi.api(
+        f"actions/workflows/{workflow_file(run)}/runs?branch=main&status=completed&per_page=10"
     )
+    for other in (data or {}).get("workflow_runs", []):
+        if other.get("conclusion") in ("cancelled", "skipped"):
+            continue
+        return other["id"] <= run["id"]
+    return True
 
 
 def report_green(run):
@@ -361,7 +373,7 @@ def handle(run_id):
     if flakes:
         report_flakes(run, flakes)
 
-    if is_main_run(run):
+    if is_main_run(run) and is_newest_main_run(run):
         if conclusion == "failure":
             report_red(run, failed)
         elif conclusion == "success":
