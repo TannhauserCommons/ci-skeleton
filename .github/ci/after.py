@@ -28,6 +28,15 @@ JUNIT_FLAKY = {"flakyFailure", "flakyError", "rerunFailure", "rerunError"}
 JUNIT_FAILED = {"failure", "error"}
 
 
+def branch():
+    """The release branch: env `CI_BRANCH`, else `main`. Empty counts as unset.
+
+    The issue title and label stay `main is red` / `main-red` whatever this says:
+    other tools look those up by name.
+    """
+    return os.environ.get("CI_BRANCH", "").strip() or "main"
+
+
 # --- text from outside -------------------------------------------------------
 
 
@@ -255,7 +264,7 @@ def last_green_sha(run):
     of the same commit is not a different base.
     """
     data = ghapi.api(
-        f"actions/workflows/{workflow_file(run)}/runs?branch=main&status=success&per_page=20"
+        f"actions/workflows/{workflow_file(run)}/runs?branch={branch()}&status=success&per_page=20"
     )
     for other in (data or {}).get("workflow_runs", []):
         if other["id"] < run["id"] and other["head_sha"] != run["head_sha"]:
@@ -313,7 +322,7 @@ def report_red(run, failed):
     commits = "```\n" + "\n".join(lines) + "\n```"
     url = run["html_url"]
     body = (
-        f"main is red.\n\n- Run: {url}\n- Failed jobs: {jobs_text}\n- Range: `{rng}`\n\n"
+        f"{branch()} is red.\n\n- Run: {url}\n- Failed jobs: {jobs_text}\n- Range: `{rng}`\n\n"
         f"Commits:\n\n{commits}\n\n{RULE}\n"
     )
     comment = (
@@ -325,8 +334,16 @@ def report_red(run, failed):
 
 
 def is_main_run(run):
-    """A `main` run for a push to main."""
-    return workflow_file(run) == "main.yml" and run.get("event") == "push"
+    """A `main.yml` run for a push to the release branch.
+
+    A push run of the same workflow on another branch is not the release
+    branch's run, so it must not open or close the issue.
+    """
+    return (
+        workflow_file(run) == "main.yml"
+        and run.get("event") == "push"
+        and run.get("head_branch") == branch()
+    )
 
 
 def is_newest_main_run(run):
@@ -336,7 +353,7 @@ def is_newest_main_run(run):
     issue against what a newer run already said about main.
     """
     data = ghapi.api(
-        f"actions/workflows/{workflow_file(run)}/runs?branch=main&status=completed&per_page=10"
+        f"actions/workflows/{workflow_file(run)}/runs?branch={branch()}&status=completed&per_page=10"
     )
     runs = (data or {}).get("workflow_runs", [])
     # Any newer finished run counts, cancelled ones too: one may be a timeout
@@ -351,7 +368,7 @@ def report_green(run):
     if not issue:
         return
     ghapi.close_issue(
-        issue["number"], f"main is green again at {run['head_sha'][:7]}: {run['html_url']}"
+        issue["number"], f"{branch()} is green again at {run['head_sha'][:7]}: {run['html_url']}"
     )
     print(f"main-red: closed #{issue['number']}")
 

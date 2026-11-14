@@ -20,10 +20,15 @@ MISE_RUN = re.compile(r"^mise run (\S+)")
 EXPRESSION = re.compile(r"\$\{\{.*?\}\}")
 EXPRESSION_BODY = re.compile(r"\$\{\{(.*?)\}\}")
 PULL_REQUEST_TARGET = re.compile(r"\bpull_request_target\b")
-CACHE_SAVE_OK = ("false", "${{ github.ref == 'refs/heads/main' }}")
+# `false`, or `github.ref == 'refs/heads/<branch>'` comparisons joined by `||`: the
+# release branch differs per project, and a cache must only be saved from there.
+_REF_IS_BRANCH = r"github\.ref\s*==\s*'refs/heads/[A-Za-z0-9._/-]+'"
+CACHE_SAVE_EXPRESSION = re.compile(
+    rf"\$\{{\{{\s*{_REF_IS_BRANCH}(?:\s*\|\|\s*{_REF_IS_BRANCH})*\s*\}}\}}"
+)
 CACHE_SAVE_MESSAGE = (
-    "jdx/mise-action must set cache_save to false or to ${{ github.ref == 'refs/heads/main' }}"
-    " (only main saves caches)"
+    "jdx/mise-action must set cache_save to false or to a comparison of github.ref "
+    "with the release branch (only the release branch saves caches)"
 )
 STRING = re.compile(r"'(?:[^']|'')*'")
 CALL = re.compile(r"([A-Za-z_]\w*)\s*\(")
@@ -184,6 +189,11 @@ def cache_save_value(sub, keys, key_indent):
     return read_keys(sub, at + 1, end, indent_of(sub[first]), ()).get("cache_save", (0, None))[1]
 
 
+def cache_save_ok(value):
+    """Whether a `cache_save` value can only save from the release branch."""
+    return value is not None and (value == "false" or CACHE_SAVE_EXPRESSION.fullmatch(value) is not None)
+
+
 def check_step(sub, key_indent):
     """Findings `(offset in sub, message)` for one step whose keys sit at `key_indent`."""
     keys = read_keys(sub, 0, len(sub), key_indent, ("uses", "run", "name"))
@@ -194,7 +204,7 @@ def check_step(sub, key_indent):
             found.append((keys["uses"][0], message))
         # Only main may save caches and the action's default is to save.
         is_mise = keys["uses"][1].lower().split("@")[0] == "jdx/mise-action"
-        if is_mise and cache_save_value(sub, keys, key_indent) not in CACHE_SAVE_OK:
+        if is_mise and not cache_save_ok(cache_save_value(sub, keys, key_indent)):
             found.append((keys["uses"][0], CACHE_SAVE_MESSAGE))
     if "run" in keys:
         at, value = keys["run"]

@@ -9,10 +9,15 @@ _token = False  # False: not looked up yet
 
 
 def repo():
-    """`owner/name` of the repository the scripts act on."""
+    """`owner/name` of the repository the scripts act on.
+
+    The workflow's own repository in CI; `CI_REPO` when a checkout should look
+    at another one (a private source tree whose releases live in a public
+    repository); else the checkout's remote.
+    """
     global _repo
     if _repo is None:
-        _repo = os.environ.get("GITHUB_REPOSITORY") or gh(
+        _repo = os.environ.get("GITHUB_REPOSITORY") or os.environ.get("CI_REPO") or gh(
             "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"
         ).strip()
     return _repo

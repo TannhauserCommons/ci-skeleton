@@ -40,9 +40,10 @@ def infra_failure(name="check / mac"):
                       step(3, "mise run check", "skipped")])
 
 
-def make_run(conclusion="failure", attempt=1, path=".github/workflows/main.yml", event="push"):
+def make_run(conclusion="failure", attempt=1, path=".github/workflows/main.yml", event="push",
+             branch="main"):
     return {
-        "id": RUN_ID, "name": "main", "path": path, "event": event,
+        "id": RUN_ID, "name": "main", "path": path, "event": event, "head_branch": branch,
         "conclusion": conclusion, "run_attempt": attempt, "head_sha": HEAD,
         "html_url": RUN_URL,
         "head_commit": {"message": "Fix it\n\nbody", "author": {"name": "Ann"}},
@@ -78,7 +79,7 @@ class FakeGitHub:
             return [i for i in self.issues if label in i["labels"] and i["state"] == "open"]
         if path.startswith("labels"):
             return []
-        if path.startswith("actions/workflows/main.yml/runs?branch=main&status=completed"):
+        if path.startswith("actions/workflows/main.yml/runs?") and "&status=completed" in path:
             return {"workflow_runs": self.completed}
         if path.startswith("actions/workflows/main.yml/runs"):
             return {"workflow_runs": self.green}
@@ -129,6 +130,13 @@ def junit(*cases):
 
 
 class AfterTestCase(unittest.TestCase):
+    def setUp(self):
+        # The tests must not depend on the CI_BRANCH of whoever runs them.
+        patch = mock.patch.dict(os.environ)
+        patch.start()
+        self.addCleanup(patch.stop)
+        os.environ.pop("CI_BRANCH", None)
+
     def run_after(self, fake, files=None, run_id=RUN_ID):
         """Run after.py against `fake`; returns (exit code, stdout, gh mock)."""
         gh = mock.Mock(side_effect=write_flake_files(files or {}))
@@ -544,6 +552,18 @@ class RedMainTests(AfterTestCase):
         body = fake.opened()[0]["body"]
         self.assertIn(f"{HEAD[:7]}  Ann  Fix it", body)
 
+    def test_queries_use_main_when_ci_branch_is_unset_or_empty(self):
+        for value in (None, "", "  "):
+            with self.subTest(value=value):
+                if value is not None:
+                    os.environ["CI_BRANCH"] = value
+                fake = self.red_fake()
+                self.run_after(fake)
+                paths = [p for _, p in fake.requested]
+                self.assertTrue(any("runs?branch=main&status=success" in p for p in paths))
+                self.assertTrue(any("runs?branch=main&status=completed" in p for p in paths))
+                self.assertTrue(fake.opened()[0]["body"].startswith("main is red."))
+
     def test_commit_text_cannot_close_the_code_fence(self):
         compare = {"commits": [{"sha": "1" * 40, "commit": {
             "author": {"name": "Eve\x1b"}, "message": "```\n@owner x"}}]}
@@ -553,6 +573,67 @@ class RedMainTests(AfterTestCase):
         fenced = body.split("```\n")[1]
         self.assertTrue(fenced.startswith("1111111  Eve"))  # subject was cut at the newline
         self.assertNotIn("\x1b", body)
+
+
+class ReleaseBranchTests(AfterTestCase):
+    """The release branch is `next`; the workflow file and the issue names stay `main`."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["CI_BRANCH"] = "next"
+
+    def next_fake(self, conclusion="failure", branch="next", **kw):
+        return FakeGitHub(make_run(conclusion, branch=branch), jobs=[real_failure("build / linux")],
+                          green=[{"id": 400, "head_sha": BASE}], compare=RedMainTests.compare, **kw)
+
+    def test_queries_carry_the_release_branch(self):
+        fake = self.next_fake()
+        self.run_after(fake)
+        paths = [p for _, p in fake.requested]
+        self.assertTrue(any("runs?branch=next&status=success" in p for p in paths))
+        self.assertTrue(any("runs?branch=next&status=completed" in p for p in paths))
+        self.assertFalse(any("branch=main" in p for p in paths))
+
+    def test_push_run_on_the_release_branch_is_handled(self):
+        fake = self.next_fake()
+        self.run_after(fake)
+        (issue,) = fake.opened()
+        self.assertEqual(issue["title"], "main is red")  # identifiers do not change
+        self.assertEqual(issue["labels"], ["main-red"])
+        self.assertTrue(issue["body"].startswith("next is red."))
+        self.assertNotIn("main is red", issue["body"])
+
+    def test_push_run_on_another_branch_is_not_handled(self):
+        fake = self.next_fake(branch="main")
+        self.run_after(fake)
+        self.assertEqual(fake.opened(), [])
+
+    def test_green_run_on_the_release_branch_closes_naming_it(self):
+        fake = FakeGitHub(make_run("success", branch="next"),
+                          issues=[open_issue(5, "main is red", "main-red")])
+        self.run_after(fake)
+        (comment,) = fake.comments()
+        self.assertTrue(comment.startswith(f"next is green again at {HEAD[:7]}"))
+        self.assertIn(RUN_URL, comment)
+
+    def test_green_run_on_another_branch_does_not_close(self):
+        fake = FakeGitHub(make_run("success", branch="main"),
+                          issues=[open_issue(5, "main is red", "main-red")])
+        self.run_after(fake)
+        self.assertEqual(fake.writes, [])
+
+    def test_default_branch_run_is_not_the_release_run_without_the_variable(self):
+        os.environ.pop("CI_BRANCH")
+        fake = self.next_fake(branch="next")
+        self.run_after(fake)
+        self.assertEqual(fake.opened(), [])
+
+    def test_branch_function(self):
+        self.assertEqual(after.branch(), "next")
+        os.environ["CI_BRANCH"] = " "
+        self.assertEqual(after.branch(), "main")
+        del os.environ["CI_BRANCH"]
+        self.assertEqual(after.branch(), "main")
 
 
 if __name__ == "__main__":

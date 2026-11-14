@@ -29,8 +29,6 @@ NOT_ASSETS = (CANDIDATE_JSON, SIGNED_JSON, "NOTES.md")
 # the name -> hash map, so record refuses names it would not keep as they are.
 SAFE_NAME = re.compile(r"[A-Za-z0-9_+-][A-Za-z0-9._+-]*")
 BUMP_ATTEMPTS = 3
-# The release's own bump commit: it changes no behaviour, so it is not in the notes.
-BUMP_SUBJECT = re.compile(r"Start v\d+\.\d+\.\d+")
 
 
 class CandidateError(Exception):
@@ -54,14 +52,22 @@ def git_ok(*args):
     return subprocess.run(["git", *args], capture_output=True).returncode == 0
 
 
-def require_bump_key():
+def branch():
+    """The release branch: env `CI_BRANCH`, else `main`. The workflow file stays `main.yml`."""
+    return (os.environ.get("CI_BRANCH") or "").strip() or "main"
+
+
+def require_bump_key(required=True):
     """Refuse unless the job has the deploy key for the bump.
 
     A push with the workflow's own token starts no workflow; the deploy key's push
     does, and that builds the next candidate. `fetch` asks first, so a missing key
-    stops the release before anything irreversible, the tag, has happened.
+    stops the release before anything irreversible, the tag, has happened. With
+    `required=False` (fetch) only an explicit non-`true` value refuses: a project
+    whose version is bumped elsewhere has no bump step and does not set the variable.
     """
-    if os.environ.get("BUMP_KEY_SET") != "true":
+    value = os.environ.get("BUMP_KEY_SET")
+    if value != "true" and (required or value is not None):
         raise CandidateError(
             "BUMP_KEY is not set: the bump is pushed with a deploy key so that it starts main "
             '(README, "Copy it into a project")'
@@ -239,15 +245,25 @@ def group_subjects(subjects):
 def build_notes(version, sha, last_tag, subjects, switch_notes="", extra_notes=""):
     """The draft's Markdown body. The last two lines (candidate sha, marker) identify the draft."""
     parts = [f"## v{version}"]
+    extras = [e.strip() for e in (switch_notes, extra_notes) if e.strip()]
     if subjects:
         for area, items in group_subjects(subjects):
             parts.append(f"### {area}\n" + "\n".join(f"- {item}" for item in items))
-    else:
+    elif not extras:
+        # Only when there is nothing else to say; other notes make the line noise.
         parts.append(f"No changes since {last_tag}." if last_tag else "No changes.")
-    for extra in (switch_notes, extra_notes):
-        if extra.strip():
-            parts.append(extra.strip())
+    parts += extras
     return "\n\n".join(parts) + f"\n\nCandidate: {sha}\n{MARKER}\n"
+
+
+def add_release_note(body, note):
+    """`body` with `note` as its own paragraph right after the first line (the heading).
+
+    The note is the owner's own text and goes in as it is, not interpreted.
+    """
+    heading, _, rest = body.partition("\n")
+    rest = rest.lstrip("\n")
+    return f"{heading}\n\n{note}\n" + (f"\n{rest}" if rest else "")
 
 
 def strip_candidate_lines(body):
@@ -268,19 +284,31 @@ def last_release_tag(sha):
         return None
 
 
-def commit_subjects(sha, last_tag):
+def names_only_the_version(subject, version):
+    """Whether a subject is one or two words followed by this version (`Start v0.1.1`, `Kiku 0.3.2`).
+
+    Such a commit only moves the version number, so it is not a change to list.
+    Another version in the subject does not match: that is a real commit.
+    """
+    pattern = rf"(?:\S+\s+){{1,2}}v?{re.escape(version)}"
+    return re.fullmatch(pattern, subject.strip()) is not None
+
+
+def commit_subjects(sha, last_tag, version):
     """Subjects of the non-merge commits since the last release, newest first."""
     span = f"{last_tag}..{sha}" if last_tag else sha
     subjects = git("log", "--no-merges", "--format=%s", span).splitlines()
-    return [s for s in subjects if s.strip() and not BUMP_SUBJECT.fullmatch(s.strip())]
+    return [s for s in subjects if s.strip() and not names_only_the_version(s, version)]
 
 
 # --- subcommands -----------------------------------------------------------------------------
 
 
 def cmd_base(args):
-    """Output `base`: the commit `main` last tested green; nothing when there is none."""
-    runs = ghapi.api("actions/workflows/main.yml/runs?branch=main&status=success&per_page=1") or {}
+    """Output `base`: the commit the release branch last tested green; nothing when there is none."""
+    runs = ghapi.api(
+        f"actions/workflows/main.yml/runs?branch={branch()}&status=success&per_page=1"
+    ) or {}
     found = runs.get("workflow_runs") or []
     if found:
         ghapi.output("base", found[0]["head_sha"])
@@ -315,7 +343,7 @@ def cmd_record(args):
         # main records the next candidate.
         print(
             f"candidate: {tag} is already released; this commit is not a candidate "
-            "(the release moves main to the next version)"
+            f"(the release moves {branch()} to the next version)"
         )
         print(f"::notice title=No candidate::{tag} is already released")
         return 0
@@ -345,7 +373,7 @@ def cmd_record(args):
         version,
         sha,
         last_tag,
-        commit_subjects(sha, last_tag),
+        commit_subjects(sha, last_tag, version),
         switches("notes"),
         notes_file.read_text(encoding="utf-8") if notes_file.is_file() else "",
     )
@@ -461,7 +489,7 @@ def resume_published():
         (r for r in all_releases() if r.get("tag_name") == tag and not r.get("draft")), None
     )
     if published is None or not tag_exists(tag):
-        raise CandidateError("no candidate: main has not been green since the last release")
+        raise CandidateError(f"no candidate: {branch()} has not been green since the last release")
     print(f"release: {tag} is already published; only the bump is left")
     # The job may have died right after the publish, before this cleanup; nothing else retries it.
     drop_manifests(published["id"], tag)
@@ -482,7 +510,7 @@ def cmd_fetch(args):
 
     Always sets the output `published`: `true` only on the resume path.
     """
-    require_bump_key()  # before any GitHub call
+    require_bump_key(required=False)  # before any GitHub call; absent means no bump step
     draft = standing_draft()
     if draft is None:
         return resume_published()
@@ -498,9 +526,9 @@ def cmd_fetch(args):
         sha = manifest["sha"]
         # The candidate must be a commit of main: a draft can only be as trustworthy as
         # the history it claims. The yes/no answer is the exit code of merge-base.
-        git("fetch", "origin", "main")
-        if not git_ok("merge-base", "--is-ancestor", sha, "origin/main"):
-            raise CandidateError(f"the candidate {sha[:7]} is not on main")
+        git("fetch", "origin", branch())
+        if not git_ok("merge-base", "--is-ancestor", sha, f"origin/{branch()}"):
+            raise CandidateError(f"the candidate {sha[:7]} is not on {branch()}")
         if tree.exists():
             raise CandidateError(f"{tree} already exists; remove it and run fetch again")
         git("worktree", "add", "--detach", str(tree), sha)
@@ -552,9 +580,13 @@ def cmd_publish(args):
     if problems:
         raise CandidateError("; ".join(problems))
     names = ", ".join(f.name for f in files)
+    # The owner's own words for this release, passed through the environment by the workflow.
+    note = (os.environ.get("RELEASE_NOTES") or "").strip()
     if args.dry_run:
         print(f"dry run: would upload {SIGNED_JSON}, then {len(files)} files to {tag}: {names}")
         print("dry run: would run switches.py shipped")
+        if note:
+            print(f"dry run: would add the release note ({len(note)} characters)")
         print(f"dry run: would publish {tag} (creates the tag at {sha[:7]})")
         print(f"dry run: would delete {CANDIDATE_JSON} and {SIGNED_JSON} from the release")
         return 0
@@ -572,11 +604,10 @@ def cmd_publish(args):
     ghapi.gh("release", "upload", draft["tag_name"], str(signed_path), "--clobber")
     ghapi.gh("release", "upload", draft["tag_name"], *[str(f) for f in files], "--clobber")
     switches("shipped")
-    ghapi.api(
-        f"releases/{draft['id']}",
-        "PATCH",
-        {"draft": False, "body": strip_candidate_lines(draft.get("body"))},
-    )
+    body = strip_candidate_lines(draft.get("body"))
+    if note:
+        body = add_release_note(body, note)
+    ghapi.api(f"releases/{draft['id']}", "PATCH", {"draft": False, "body": body})
     drop_manifests(draft["id"], tag)
     print(f"published: {tag} {sha[:7]} ({len(files)} files)")
     return 0
@@ -605,7 +636,7 @@ def next_patch(version):
 
 
 def cmd_bump(args):
-    """Move `main` to the version after the one just released."""
+    """Move the release branch to the version after the one just released."""
     released = args.released.removeprefix("v")
     nxt = next_patch(released)
     if not args.dry_run:
@@ -614,28 +645,28 @@ def cmd_bump(args):
         # Read the tree as it is: a dry run must not touch the checkout.
         carried = mise_version()
         if carried != released:
-            print(f"main already carries {carried}; nothing to bump")
+            print(f"{branch()} already carries {carried}; nothing to bump")
         else:
-            print(f"dry run: would bump main to {nxt}")
+            print(f"dry run: would bump {branch()} to {nxt}")
         return 0
     for attempt in range(1, BUMP_ATTEMPTS + 1):
-        # Start from the real tip of main each time: a rejected push means it moved.
-        git("fetch", "origin", "main")
-        git("checkout", "--detach", "origin/main")
+        # Start from the real tip of the branch each time: a rejected push means it moved.
+        git("fetch", "origin", branch())
+        git("checkout", "--detach", f"origin/{branch()}")
         carried = mise_version()
         if carried != released:
-            print(f"main already carries {carried}; nothing to bump")
+            print(f"{branch()} already carries {carried}; nothing to bump")
             return 0
         mise_bump(nxt)
         git("commit", "-am", f"Start v{nxt}")
         try:
-            git("push", "origin", "HEAD:main")
+            git("push", "origin", f"HEAD:{branch()}")
         except RuntimeError as err:
             if attempt == BUMP_ATTEMPTS:
-                raise CandidateError(f"push to main failed {BUMP_ATTEMPTS} times: {err}") from err
-            print(f"push rejected (attempt {attempt}); main moved, trying again")
+                raise CandidateError(f"push to {branch()} failed {BUMP_ATTEMPTS} times: {err}") from err
+            print(f"push rejected (attempt {attempt}); {branch()} moved, trying again")
             continue
-        print(f"bumped main to {nxt}")
+        print(f"bumped {branch()} to {nxt}")
         return 0
     return 1  # unreachable: the loop returns or raises
 

@@ -72,13 +72,17 @@ Leave out what a project doesn't have (no screens: no `looks` job). `fixture/tas
 
 ## Releasing
 
-`mise run status` shows the candidate. To release it, run the `release` workflow (`gh workflow run release.yml`, or the button). With `dry_run` it fetches, signs and checks, and publishes nothing.
+`mise run status` shows the candidate. To release it, run the `release` workflow (`gh workflow run release.yml`, or the button). With `dry_run` it fetches, signs and checks, and publishes nothing. `notes` puts a note at the top of the release text.
 
 To release a different version than the one `main` carries (a minor bump), land a commit that runs `mise run bump <version>`; `main` builds that candidate, then release.
 
 If a release fails, rerun it. Nothing is tagged until the last step, and a rerun after the publish only finishes the bump. If a rerun says the candidate failed its checks, rerun the last `main` run instead: it records the candidate afresh.
 
 A `main` run that is cancelled after it started counts as red, because GitHub reports a job that hit its timeout the same way. The next green run closes the issue.
+
+## A release branch that isn't `main`
+
+Some projects keep their default branch for released commits only and build the next release on another branch (for example a public repository fed from a private one). Set `CI_BRANCH` to that branch's name in the workflows' `env`, use the same name in `main.yml`'s trigger and in the `cache_save` lines, and, if the version is bumped somewhere else, remove `BUMP_KEY_SET` and the `ci:bump` step from `release.yml`.
 
 ## Feature switches
 
