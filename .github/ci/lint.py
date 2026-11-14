@@ -18,7 +18,25 @@ CHAINED = re.compile(r"[;&|`<>]|\$\(")
 MISE_RUN = re.compile(r"^mise run (\S+)")
 # `${{ a && b || c }}` is one value to the shell, whatever operators it holds.
 EXPRESSION = re.compile(r"\$\{\{.*?\}\}")
+EXPRESSION_BODY = re.compile(r"\$\{\{(.*?)\}\}")
 PULL_REQUEST_TARGET = re.compile(r"\bpull_request_target\b")
+STRING = re.compile(r"'(?:[^']|'')*'")
+CALL = re.compile(r"([A-Za-z_]\w*)\s*\(")
+OPERATORS = re.compile(r"&&|\|\||!=|==|[!()]")
+LITERALS = ("true", "false", "null")
+# The only contexts a `run:` line may read: ones no pull request author controls.
+TRUSTED = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"inputs\.[\w-]+",
+        r"steps\.[\w-]+\.outputs\.[\w-]+",
+        r"matrix\.[\w-]+",
+        r"github\.(?:sha|run_id)",
+        r"github\.event\.before",
+        r"github\.event\.pull_request\.base\.sha",
+        r"github\.event\.workflow_run\.id",
+    )
+)
 
 
 def strip_comment(line):
@@ -112,6 +130,29 @@ def check_pin(value):
     return f"uses `{value}` is not pinned to a 40-hex commit SHA"
 
 
+def untrusted(expression):
+    """What an `${{ }}` body reads that a `run:` line may not: contexts, calls, stray tokens."""
+    expression = STRING.sub(" ", expression)
+    calls = [f"{name}()" for name in CALL.findall(expression)]
+    if calls:
+        return calls
+    tokens = OPERATORS.sub(" ", expression).split()
+    return [t for t in tokens if t not in LITERALS and not any(p.fullmatch(t) for p in TRUSTED)]
+
+
+def sets_cache_save(sub, keys, key_indent):
+    """Whether the step's `with:` holds a `cache_save` key (block or inline form)."""
+    if "with" not in keys:
+        return False
+    at, value = keys["with"]
+    if value:
+        return re.search(r"\bcache_save\s*:", value) is not None
+    first = next((i for i in range(at + 1, len(sub)) if content_of(sub[i])), None)
+    if first is None or indent_of(sub[first]) <= key_indent:
+        return False
+    return "cache_save" in read_keys(sub, at + 1, len(sub), indent_of(sub[first]), ())
+
+
 def check_step(sub, key_indent):
     """Findings `(offset in sub, message)` for one step whose keys sit at `key_indent`."""
     keys = read_keys(sub, 0, len(sub), key_indent, ("uses", "run", "name"))
@@ -120,8 +161,19 @@ def check_step(sub, key_indent):
         message = check_pin(keys["uses"][1])
         if message:
             found.append((keys["uses"][0], message))
+        # Only main may save caches and the action's default is to save.
+        if keys["uses"][1].lower().split("@")[0] == "jdx/mise-action" and not sets_cache_save(sub, keys, key_indent):
+            found.append((keys["uses"][0], "jdx/mise-action must set cache_save (only main saves caches)"))
     if "run" in keys:
         at, value = keys["run"]
+        # Expressions are filled in before the shell sees the line, so one that
+        # reads attacker-controlled text is a shell injection.
+        seen = []
+        for body in EXPRESSION_BODY.findall(value):
+            for token in untrusted(body):
+                if token not in seen:
+                    seen.append(token)
+                    found.append((at, f"run: reads ${{{{ {token} }}}}; pass it through env instead"))
         task = MISE_RUN.match(value)
         if "\n" in value or not task or CHAINED.search(EXPRESSION.sub("", value)):
             found.append((at, "run is not a single `mise run ...` line"))
@@ -181,6 +233,20 @@ def check_job(lines, start, end):
     return found
 
 
+def read_only(lines, at):
+    """Whether the top-level `permissions:` at `lines[at]` is exactly `contents: read`.
+
+    Jobs widen what they need themselves, so only the workflow-wide default is held to this.
+    """
+    value = parse_key(content_of(lines[at]))[1]
+    if value:
+        inline = value.startswith("{") and value.endswith("}")
+        grants = [part.strip() for part in value[1:-1].split(",")] if inline else [value]
+    else:
+        grants = [content_of(line) for line in lines[at + 1 : section_end(lines, at + 1, 0)] if content_of(line)]
+    return grants == ["contents: read"]
+
+
 def lint_text(text):
     """All findings for one workflow, as sorted `(line number, message)`."""
     lines = text.splitlines()
@@ -194,6 +260,8 @@ def lint_text(text):
             found.append((i, "pull_request_target is not allowed"))
     if "permissions" not in top:
         found.append((0, "no top-level permissions:"))
+    elif not read_only(lines, top["permissions"]):
+        found.append((top["permissions"], "top-level permissions must be exactly `contents: read`"))
     if "jobs" in top:
         start = top["jobs"] + 1
         end = section_end(lines, start, 0)
