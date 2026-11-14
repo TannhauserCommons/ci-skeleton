@@ -813,6 +813,58 @@ class FetchResumeTest(Base):
         self.assertIn("::warning", out)
         self.assertIn("published=true", gh_out.read_text())
 
+    def test_a_published_release_for_the_trees_version_wins_over_any_draft(self):
+        unrelated = draft("v0.3.0", sha_="d" * 40)
+        fake = FakeGitHub(releases=[unrelated, self.published()], tags=["v0.2.0"])
+        (code, out, _), gh_out = self.resume(fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(fake.events, [])  # nothing downloaded, the draft untouched
+        self.assertFalse(self.tree.exists())
+        self.assertIn("published=true", gh_out.read_text())
+        self.assertIn("release: v0.2.0 is already published", out)
+
+    def test_an_unreleased_tree_version_takes_the_normal_path(self):
+        downloads = FetchTest.files(self)
+        fake = FakeGitHub(
+            releases=[self.published("v0.1.0"), draft("v0.2.0")],
+            tags=["v0.1.0"],
+            downloads=downloads,
+        )
+        (code, _, err), gh_out = self.resume(fake)
+        self.assertEqual(code, 0, err)
+        self.assertIn("published=false", gh_out.read_text())
+        self.assertEqual(fake.events, [("download", "v0.2.0")])
+
+    def test_the_tree_version_is_read_before_any_release_is_looked_at(self):
+        order = []
+        fake = FakeGitHub(releases=[self.published()], tags=["v0.2.0"])
+        real_api = fake.api
+        fake.api = lambda path, *a, **k: (
+            order.append(path.split("?")[0]) if path.startswith("releases?") else None,
+            real_api(path, *a, **k),
+        )[1]
+        self.install(fake)
+        mock.patch.object(candidate, "mise_version", lambda: order.append("version") or "0.2.0").start()
+        self.addCleanup(mock.patch.stopall)
+        run(None, ["fetch", "--tree", str(self.tree)])
+        self.assertEqual(order[:2], ["version", "releases"])
+
+    def test_dry_run_removes_no_manifests_on_the_resume_path(self):
+        assets = [{"id": 1, "name": "candidate.json"}, {"id": 3, "name": "signed.json"}]
+        fake = FakeGitHub(releases=[self.published()], tags=["v0.2.0"], assets=assets)
+        with mock.patch.dict(os.environ, {"DRY_RUN": "1"}):
+            (code, out, _), _ = self.resume(fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(fake.events, [])
+        self.assertIn("dry run: would remove the manifests from v0.2.0", out.splitlines())
+
+    def test_dry_run_is_quiet_when_no_manifests_are_left(self):
+        fake = FakeGitHub(releases=[self.published()], tags=["v0.2.0"])
+        with mock.patch.dict(os.environ, {"DRY_RUN": "1"}):
+            (code, out, _), _ = self.resume(fake)
+        self.assertEqual(code, 0)
+        self.assertNotIn("would remove", out)
+
     def test_annotated_tag_resolves_to_its_commit(self):
         fake = FakeGitHub(
             releases=[self.published()], tags=["v0.2.0"], annotated=["v0.2.0"]

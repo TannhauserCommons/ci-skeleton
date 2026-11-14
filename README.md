@@ -92,7 +92,7 @@ Some projects keep their default branch for released commits only and build the 
 
 ```sh
 mise install        # the pinned tools
-mise run status     # red main, red or stuck pull requests, the candidate, open flakes
+mise run status     # red main; red, stuck and green-and-waiting pull requests; the candidate; open flakes
 mise run check      # this repo: the scripts' tests and the fixture's tests
 mise run ci:lint    # actionlint plus the skeleton's own workflow rules
 ```
