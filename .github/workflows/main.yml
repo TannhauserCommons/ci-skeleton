@@ -21,6 +21,11 @@ concurrency:
 jobs:
   check:
     uses: ./.github/workflows/check.yml
+    # A called workflow can use only what its caller grants: this is the most
+    # any job in check.yml asks for.
+    permissions:
+      contents: read
+      pull-requests: read
     with:
       all: true
 
