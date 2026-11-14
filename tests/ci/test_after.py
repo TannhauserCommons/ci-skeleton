@@ -162,7 +162,7 @@ class SkipTests(AfterTestCase):
         self.assertEqual(fake.posts("rerun-failed-jobs"), [])
         opened = fake.opened()
         self.assertEqual(len(opened), 1)
-        self.assertIn("build (linux) (timed out or cancelled)", opened[0]["body"])
+        self.assertIn("` build (linux) ` (timed out or cancelled)", opened[0]["body"])
 
     def test_main_run_replaced_before_it_started_does_nothing(self):
         waiting = job("build (linux)", [], conclusion="cancelled")
@@ -486,12 +486,23 @@ class RedMainTests(AfterTestCase):
         self.run_after(fake)
         self.assertEqual(fake.writes, [])
 
-    def test_a_newer_cancelled_run_does_not_count_as_newer(self):
-        fake = FakeGitHub(make_run("failure"), jobs=[real_failure()])
+    def test_a_newer_cancelled_run_counts_as_newer(self):
+        # It may be a timeout that is red; an old green run must not close its issue.
+        fake = FakeGitHub(make_run("success"), issues=[open_issue(7, "main is red", "main-red")])
         fake.completed = [{"id": RUN_ID + 1, "conclusion": "cancelled"},
-                          {"id": RUN_ID, "conclusion": "failure"}]
+                          {"id": RUN_ID, "conclusion": "success"}]
         self.run_after(fake)
-        self.assertEqual(len(fake.opened()), 1)
+        self.assertEqual(fake.writes, [])
+
+    def test_a_stopped_gate_job_is_still_the_gate(self):
+        gate = job("check / gate", [step(1, "Set up job")], conclusion="cancelled")
+        hung = job("build", [step(1, "Set up job"), step(2, "mise run build", "cancelled")],
+                   conclusion="cancelled")
+        fake = FakeGitHub(make_run("cancelled"), jobs=[hung, gate])
+        self.run_after(fake)
+        body = fake.opened()[0]["body"]
+        self.assertIn("` build ` (timed out or cancelled)", body)
+        self.assertNotIn("gate", body)
 
     def test_path_with_ref_suffix_still_identifies_the_workflow(self):
         run = make_run("failure", path=".github/workflows/main.yml@refs/heads/main")

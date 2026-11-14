@@ -88,7 +88,7 @@ def stopped_jobs(jobs):
     A run that was replaced while it waited never started a job, so it has none.
     """
     return [
-        {**job, "name": f"{job.get('name')} (timed out or cancelled)"}
+        {**job, "stopped": True}
         for job in jobs
         if job.get("conclusion") == "cancelled"
         and any(step.get("conclusion") == "success" for step in job.get("steps") or [])
@@ -299,7 +299,10 @@ def failed_job_text(failed):
     """The failed job names for an issue, or why there are none."""
     if not failed:
         return "none recorded (the run was cancelled or timed out)"
-    return ", ".join(md_code(clean(job["name"])) for job in causes(failed))
+    return ", ".join(
+        md_code(clean(job["name"])) + (" (timed out or cancelled)" if job.get("stopped") else "")
+        for job in causes(failed)
+    )
 
 
 def report_red(run, failed):
@@ -335,11 +338,11 @@ def is_newest_main_run(run):
     data = ghapi.api(
         f"actions/workflows/{workflow_file(run)}/runs?branch=main&status=completed&per_page=10"
     )
-    for other in (data or {}).get("workflow_runs", []):
-        if other.get("conclusion") in ("cancelled", "skipped"):
-            continue
-        return other["id"] <= run["id"]
-    return True
+    runs = (data or {}).get("workflow_runs", [])
+    # Any newer finished run counts, cancelled ones too: one may be a timeout
+    # that is red, and one replaced while it waited has a successor that will
+    # report in its place.
+    return not runs or runs[0]["id"] <= run["id"]
 
 
 def report_green(run):
