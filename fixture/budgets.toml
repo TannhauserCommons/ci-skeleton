@@ -1,0 +1,6 @@
+# Exact metrics, checked by `mise run budgets`. Raising a max is the owner's call.
+
+[[budget]]
+name = "source-bytes"
+max = 3100
+why = "The app is a few lines on purpose; growth should be a decision, not drift."
