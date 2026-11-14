@@ -76,7 +76,9 @@ Leave out what a project doesn't have (no screens: no `looks` job). `fixture/tas
 
 To release a different version than the one `main` carries (a minor bump), land a commit that runs `mise run bump <version>`; `main` builds that candidate, then release.
 
-If a release fails, rerun it. Nothing is tagged until the last step, and a rerun after the publish only finishes the bump.
+If a release fails, rerun it. Nothing is tagged until the last step, and a rerun after the publish only finishes the bump. If a rerun says the candidate failed its checks, rerun the last `main` run instead: it records the candidate afresh.
+
+A `main` run that is cancelled after it started counts as red, because GitHub reports a job that hit its timeout the same way. The next green run closes the issue.
 
 ## Feature switches
 
