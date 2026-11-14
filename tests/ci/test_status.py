@@ -31,12 +31,13 @@ def check(conclusion, started=5, name="gate", state="completed"):
 
 
 class FakeGitHub:
-    def __init__(self, prs=(), checks=None, releases=(), red=None, flaky=0):
+    def __init__(self, prs=(), checks=None, releases=(), red=None, flaky=0, runs=()):
         self.prs = list(prs)
         self.checks = checks or {}  # sha -> list of check runs
         self.releases = list(releases)
         self.red = red
         self.flaky = flaky
+        self.runs = [{"conclusion": c, "html_url": f"https://x/runs/{i}"} for i, c in enumerate(runs)]
         self.requested = []
 
     def __call__(self, path, method="GET", body=None, paginate=False):
@@ -46,6 +47,8 @@ class FakeGitHub:
         if path.startswith("commits/") and "/check-runs" in path:
             sha = path.split("/")[1]
             return {"check_runs": self.checks.get(sha, [])}
+        if path.startswith("actions/workflows/main.yml/runs?branch=main&status=completed"):
+            return {"workflow_runs": self.runs}
         if path.startswith("releases"):
             return self.releases
         if path.startswith("issues?state=open&labels=main-red"):
@@ -78,6 +81,16 @@ class StatusTests(unittest.TestCase):
     def test_main_red_with_issue_link(self):
         red = {"number": 3, "title": "main is red", "html_url": "https://github.com/o/r/issues/3"}
         self.assertEqual(self.lines(FakeGitHub(red=red))[0], "main: red  https://github.com/o/r/issues/3")
+
+    def test_newest_main_run_failed_at_startup_is_red_without_an_issue(self):
+        lines = self.lines(FakeGitHub(runs=["startup_failure", "success"]))
+        self.assertEqual(lines[0], "main: red  startup_failure  https://x/runs/0")
+
+    def test_cancelled_main_run_leaves_the_run_before_it_standing(self):
+        self.assertEqual(self.lines(FakeGitHub(runs=["cancelled", "success", "failure"]))[0],
+                         "main: green")
+        self.assertEqual(self.lines(FakeGitHub(runs=["cancelled", "failure"]))[0],
+                         "main: red  failure  https://x/runs/1")
 
     def test_pr_with_failed_gate(self):
         p = pr(12, "Break things")
