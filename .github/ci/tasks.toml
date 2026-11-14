@@ -7,7 +7,7 @@ run = "python .github/ci/status.py"
 
 ["ci:select"]
 description = "check: which path-gated jobs run, and which the gate may see skipped"
-run = "python .github/ci/select.py"
+run = "python .github/ci/paths.py"
 
 ["ci:lint"]
 description = "Workflow lint: actionlint plus the skeleton's own rules"

@@ -1,0 +1,713 @@
+import contextlib
+import hashlib
+import io
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+# Appended, not inserted first: .github/ci/select.py must not shadow the stdlib `select`.
+sys.path.append(str(Path(__file__).resolve().parents[2] / ".github" / "ci"))
+
+import candidate  # noqa: E402
+import ghapi  # noqa: E402
+
+SHA = "a" * 40
+TAG_OBJECT = "e" * 40
+MARK = candidate.MARKER
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+class FakeGitHub:
+    """Stands in for ghapi.api / ghapi.gh and records what was done, in order."""
+
+    def __init__(self, releases=None, assets=None, tags=(), downloads=None, annotated=()):
+        self.releases = releases if releases is not None else []
+        self.assets = assets if assets is not None else []
+        self.tags = list(tags)
+        self.annotated = set(annotated)  # tags that are tag objects, not lightweight
+        self.downloads = downloads or {}
+        self.events = []
+
+    def api(self, path, method="GET", body=None, paginate=False):
+        if method == "GET" and path.startswith("releases?"):
+            return self.releases
+        if method == "GET" and path.startswith("git/matching-refs/tags/"):
+            tag = path.split("/tags/", 1)[1].split("?")[0]
+            return [
+                {
+                    "ref": f"refs/tags/{t}",
+                    "object": {
+                        "sha": TAG_OBJECT if t in self.annotated else SHA,
+                        "type": "tag" if t in self.annotated else "commit",
+                    },
+                }
+                for t in self.tags
+                if t.startswith(tag)
+            ]
+        if method == "GET" and path == f"git/tags/{TAG_OBJECT}":
+            return {"object": {"sha": SHA, "type": "commit"}}
+        if method == "POST" and path == "actions/workflows/main.yml/dispatches":
+            self.events.append(("dispatch", body))
+            return None
+        if method == "GET" and path.startswith("releases/") and "/assets" in path:
+            return self.assets
+        if method == "GET" and path.startswith("actions/workflows/main.yml/runs"):
+            return {"workflow_runs": self.runs} if hasattr(self, "runs") else {"workflow_runs": []}
+        if method == "DELETE" and path.startswith("releases/assets/"):
+            asset_id = int(path.rsplit("/", 1)[1])
+            name = next(a["name"] for a in self.assets if a["id"] == asset_id)
+            self.events.append(("delete", name))
+            return None
+        if method == "POST" and path == "releases":
+            self.events.append(("create", body))
+            return {"id": 99, **body}
+        if method == "PATCH" and path.startswith("releases/"):
+            self.events.append(("patch", body))
+            return {"id": int(path.split("/")[1]), **body}
+        raise AssertionError(f"unexpected api call {method} {path}")
+
+    def gh(self, *args, stdin=None, check=True):
+        if args[:2] == ("release", "upload"):
+            names = [Path(a).name for a in args[3:] if a != "--clobber"]
+            self.events.append(("upload", names))
+        elif args[:2] == ("release", "download"):
+            directory = Path(args[args.index("--dir") + 1])
+            for name, data in self.downloads.items():
+                (directory / name).write_bytes(data)
+            self.events.append(("download", args[2]))
+        else:
+            raise AssertionError(f"unexpected gh call {args}")
+        return ""
+
+    def kinds(self):
+        return [e[0] for e in self.events]
+
+
+def run(func, *args, **kwargs):
+    """Run a command function capturing stdout and stderr; returns (code, out, err)."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = candidate.main(*args, **kwargs) if func is None else func(*args, **kwargs)
+    return code, out.getvalue(), err.getvalue()
+
+
+def draft(tag="v0.2.0", sha_=SHA, body=None, id_=7, draft_=True):
+    return {
+        "id": id_,
+        "draft": draft_,
+        "tag_name": tag,
+        "target_commitish": sha_,
+        "body": body if body is not None else f"## {tag}\n\nCandidate: {sha_}\n{MARK}\n",
+    }
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name) / "dist"
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in ("GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_OUTPUT"):
+            os.environ.pop(key, None)
+
+    def install(self, fake, version="0.2.0", switch_notes="", git=None):
+        """Patch every outside call; returns the git calls list."""
+        self.git_calls = []
+        subjects = getattr(self, "subjects", [])
+
+        def fake_git(*args):
+            self.git_calls.append(args)
+            if args[0] == "rev-parse":
+                return SHA + "\n"
+            if args[0] == "describe":
+                raise RuntimeError("no tags")
+            if args[0] == "log":
+                return "\n".join(subjects) + "\n"
+            return ""
+
+        for target, value in (
+            (ghapi, {"api": fake.api, "gh": fake.gh}),
+            (candidate, {"git": git or fake_git, "mise_version": lambda: version}),
+        ):
+            for name, func in value.items():
+                patcher = mock.patch.object(target, name, func)
+                patcher.start()
+                self.addCleanup(patcher.stop)
+        sw = mock.patch.object(
+            candidate,
+            "switches",
+            lambda *a: (self.switch_calls.append(a), switch_notes if a == ("notes",) else "")[1],
+        )
+        self.switch_calls = []
+        sw.start()
+        self.addCleanup(sw.stop)
+
+    def write(self, name, data=b"x"):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        (self.dir / name).write_bytes(data)
+
+
+class NotesTest(unittest.TestCase):
+    def test_groups_by_area_in_first_appearance_order_other_last(self):
+        notes = candidate.build_notes(
+            "0.2.0",
+            SHA,
+            "v0.1.0",
+            [
+                "cli: add flag",
+                "fix the thing",
+                "core: speed up",
+                "cli: rename flag",
+                "this prefix is way too long to count as an area at all: x",
+                "a b c d: four words",
+            ],
+        )
+        self.assertEqual(
+            notes,
+            "## v0.2.0\n\n"
+            "### cli\n- add flag\n- rename flag\n\n"
+            "### core\n- speed up\n\n"
+            "### Other\n- fix the thing\n"
+            "- this prefix is way too long to count as an area at all: x\n"
+            "- a b c d: four words\n\n"
+            f"Candidate: {SHA}\n{MARK}\n",
+        )
+
+    def test_other_comes_last_even_when_it_appears_first(self):
+        groups = candidate.group_subjects(["plain", "cli: a"])
+        self.assertEqual([g[0] for g in groups], ["cli", "Other"])
+
+    def test_no_commits(self):
+        notes = candidate.build_notes("0.2.0", SHA, "v0.1.0", [])
+        self.assertIn("No changes since v0.1.0.", notes)
+        self.assertNotIn("###", notes)
+
+    def test_switches_and_notes_md_are_appended_and_marker_is_last(self):
+        notes = candidate.build_notes(
+            "0.2.0", SHA, None, ["cli: a"], "### Switches\n- shout\n", "perf table\n"
+        )
+        self.assertLess(notes.index("### cli"), notes.index("### Switches"))
+        self.assertLess(notes.index("### Switches"), notes.index("perf table"))
+        self.assertLess(notes.index("perf table"), notes.index("Candidate:"))
+        lines = notes.rstrip().splitlines()
+        self.assertEqual(lines[-1], MARK)
+        self.assertEqual(lines[-2], f"Candidate: {SHA}")
+
+    def test_strip_candidate_lines_roundtrip(self):
+        notes = candidate.build_notes("0.2.0", SHA, None, ["cli: a"], "", "extra")
+        stripped = candidate.strip_candidate_lines(notes)
+        self.assertNotIn("Candidate:", stripped)
+        self.assertNotIn(MARK, stripped)
+        self.assertTrue(stripped.rstrip().endswith("extra"))
+
+    def test_next_patch(self):
+        self.assertEqual(candidate.next_patch("0.2.9"), "0.2.10")
+        with self.assertRaises(candidate.CandidateError):
+            candidate.next_patch("0.2")
+        with self.assertRaises(candidate.CandidateError):
+            candidate.next_patch("1.0.0-rc1")
+
+
+class SubjectsTest(unittest.TestCase):
+    def test_the_release_bump_commit_is_left_out_of_the_notes(self):
+        log = "cli: add flag\nStart v0.2.1\nStart the engine sooner\n"
+        with mock.patch.object(candidate, "git", lambda *args: log):
+            self.assertEqual(
+                candidate.commit_subjects(SHA, "v0.2.0"),
+                ["cli: add flag", "Start the engine sooner"],
+            )
+
+
+class DraftTest(Base):
+    def test_two_marked_drafts_is_an_error_naming_them(self):
+        fake = FakeGitHub(releases=[draft("v0.2.0", id_=1), draft("v0.3.0", id_=2)])
+        self.install(fake)
+        code, _, err = run(None, ["fetch", "--dir", str(self.dir)])
+        self.assertEqual(code, 1)
+        self.assertIn("v0.2.0", err)
+        self.assertIn("v0.3.0", err)
+
+    def test_unmarked_and_published_releases_are_ignored(self):
+        fake = FakeGitHub(
+            releases=[
+                draft("v0.1.0", body="no marker", id_=1),
+                draft("v0.0.9", draft_=False, id_=2),
+                draft("v0.2.0", id_=3),
+            ]
+        )
+        self.install(fake)
+        self.assertEqual(candidate.standing_draft()["id"], 3)
+
+    def test_base_outputs_head_sha_or_nothing(self):
+        gh_out = Path(self.tmp.name) / "out.txt"
+        os.environ["GITHUB_OUTPUT"] = str(gh_out)
+        fake = FakeGitHub()
+        self.install(fake)
+        self.assertEqual(run(candidate.cmd_base, None), (0, "", ""))
+        self.assertFalse(gh_out.exists())
+        fake.runs = [{"head_sha": SHA}]
+        self.assertEqual(run(candidate.cmd_base, None), (0, f"base={SHA}\n", ""))
+        self.assertEqual(gh_out.read_text(), f"base={SHA}\n")
+
+
+class RecordTest(Base):
+    def args(self):
+        return ["record", "--dir", str(self.dir)]
+
+    def test_released_version_is_no_candidate_and_no_failure(self):
+        self.write("app.zip")
+        # A draft is there too: it must stay untouched.
+        fake = FakeGitHub(tags=["v0.2.0"], releases=[draft("v0.3.0")])
+        self.install(fake)
+        code, out, _ = run(None, self.args())
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            out.splitlines(),
+            [
+                "candidate: v0.2.0 is already released; this commit is not a candidate "
+                "(the release moves main to the next version)",
+                "::notice title=No candidate::v0.2.0 is already released",
+            ],
+        )
+        self.assertEqual(fake.events, [])
+        self.assertFalse((self.dir / "candidate.json").exists())
+
+    def test_prefix_tag_does_not_count(self):
+        self.write("app.zip")
+        fake = FakeGitHub(tags=["v0.2.0-rc1"])
+        self.install(fake)
+        self.assertEqual(run(None, self.args())[0], 0)
+
+    def test_refuses_empty_dir_or_only_notes_and_manifest(self):
+        self.write("NOTES.md")
+        self.write("candidate.json", b"{}")
+        fake = FakeGitHub()
+        self.install(fake)
+        code, _, err = run(None, self.args())
+        self.assertEqual(code, 1)
+        self.assertIn("no release files", err)
+        self.assertEqual(fake.events, [])
+
+    def test_refuses_subdirectory(self):
+        self.write("app.zip")
+        (self.dir / "sub").mkdir()
+        self.install(FakeGitHub())
+        code, _, err = run(None, self.args())
+        self.assertEqual(code, 1)
+        self.assertIn("sub", err)
+
+    def test_refuses_names_github_would_rewrite(self):
+        self.write("my app.zip")
+        self.install(FakeGitHub())
+        code, _, err = run(None, self.args())
+        self.assertEqual(code, 1)
+        self.assertIn("my app.zip", err)
+
+    def test_creates_draft_and_orders_assets(self):
+        self.write("b.zip", b"bbb")
+        self.write("a.zip", b"aaa")
+        self.write("NOTES.md", b"perf table")
+        os.environ.update(GITHUB_SHA=SHA, GITHUB_RUN_ID="12", GITHUB_RUN_ATTEMPT="2")
+        fake = FakeGitHub()
+        self.subjects = ["cli: add flag", "fix"]
+        self.install(fake, switch_notes="### Switches\n- shout")
+        code, out, _ = run(None, self.args())
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), f"candidate: v0.2.0 {SHA[:7]} (2 files)")
+        self.assertEqual(fake.kinds(), ["create", "upload", "upload"])
+        kind, fields = fake.events[0]
+        self.assertEqual(fields["tag_name"], "v0.2.0")
+        self.assertEqual(fields["name"], "v0.2.0")
+        self.assertEqual(fields["target_commitish"], SHA)
+        self.assertIs(fields["draft"], True)
+        self.assertIn("### cli\n- add flag", fields["body"])
+        self.assertIn("### Switches", fields["body"])
+        self.assertIn("perf table", fields["body"])
+        self.assertTrue(fields["body"].rstrip().endswith(MARK))
+        self.assertEqual(fake.events[1], ("upload", ["a.zip", "b.zip"]))
+        self.assertEqual(fake.events[2], ("upload", ["candidate.json"]))
+        manifest = json.loads((self.dir / "candidate.json").read_text())
+        self.assertEqual(list(manifest), ["sha", "version", "run_id", "run_attempt", "files"])
+        self.assertEqual(manifest["run_id"], 12)
+        self.assertEqual(manifest["run_attempt"], 2)
+        self.assertEqual(manifest["files"], {"a.zip": sha(b"aaa"), "b.zip": sha(b"bbb")})
+
+    def test_no_env_uses_git_head_and_zero_run_ids(self):
+        self.write("a.zip")
+        fake = FakeGitHub()
+        self.install(fake)
+        run(None, self.args())
+        manifest = json.loads((self.dir / "candidate.json").read_text())
+        self.assertEqual(manifest["sha"], SHA)
+        self.assertEqual((manifest["run_id"], manifest["run_attempt"]), (0, 0))
+
+    def test_updates_existing_draft_and_deletes_manifest_first(self):
+        self.write("a.zip")
+        old = draft("v0.2.0", sha_="b" * 40)
+        fake = FakeGitHub(
+            releases=[old],
+            assets=[
+                {"id": 1, "name": "a.zip"},
+                {"id": 2, "name": "gone.zip"},
+                {"id": 3, "name": "candidate.json"},
+            ],
+        )
+        self.install(fake)
+        code, _, _ = run(None, self.args())
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            fake.events[1:],
+            [
+                ("delete", "candidate.json"),
+                ("delete", "a.zip"),
+                ("delete", "gone.zip"),
+                ("upload", ["a.zip"]),
+                ("upload", ["candidate.json"]),
+            ],
+        )
+        self.assertEqual(fake.events[0][0], "patch")
+        self.assertEqual(fake.events[0][1]["target_commitish"], SHA)
+        self.assertNotIn("create", fake.kinds())
+
+    def test_last_tag_bounds_the_log(self):
+        self.write("a.zip")
+
+        def fake_git(*args):
+            if args[0] == "describe":
+                return "v0.1.0\n"
+            if args[0] == "log":
+                self.log_args = args
+                return "cli: x\n"
+            return SHA + "\n"
+
+        self.install(FakeGitHub(), git=fake_git)
+        run(None, self.args())
+        self.assertEqual(self.log_args[-1], f"v0.1.0..{SHA}")
+        self.assertIn("--no-merges", self.log_args)
+
+
+class FetchTest(Base):
+    def files(self, **over):
+        data = {"a.zip": b"aaa", "b.zip": b"bbb"}
+        manifest = {
+            "sha": SHA,
+            "version": "0.2.0",
+            "run_id": 1,
+            "run_attempt": 1,
+            "files": {n: sha(d) for n, d in data.items()},
+        }
+        downloads = {**data, "candidate.json": json.dumps(manifest).encode()}
+        for key, value in over.items():
+            if value is None:
+                downloads.pop(key)
+            else:
+                downloads[key] = value
+        return downloads
+
+    def fetch(self, downloads, release=None):
+        fake = FakeGitHub(releases=[release or draft()], downloads=downloads)
+        self.install(fake)
+        return run(None, ["fetch", "--dir", str(self.dir)])
+
+    def test_passes_and_outputs(self):
+        gh_out = Path(self.tmp.name) / "out.txt"
+        os.environ["GITHUB_OUTPUT"] = str(gh_out)
+        code, out, _ = self.fetch(self.files())
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            gh_out.read_text().splitlines(),
+            ["published=false", f"sha={SHA}", "version=0.2.0", "tag=v0.2.0"],
+        )
+        self.assertIn("tag=v0.2.0", out)
+
+    def test_no_candidate(self):
+        self.install(FakeGitHub())
+        code, _, err = run(None, ["fetch", "--dir", str(self.dir)])
+        self.assertEqual(code, 1)
+        self.assertIn("no candidate: main has not been green since the last release", err)
+
+    def test_missing_manifest(self):
+        code, _, err = self.fetch(self.files(**{"candidate.json": None}))
+        self.assertEqual(code, 1)
+        self.assertIn("candidate.json is missing", err)
+
+    def test_missing_file(self):
+        code, _, err = self.fetch(self.files(**{"b.zip": None}))
+        self.assertEqual(code, 1)
+        self.assertIn("missing file: b.zip", err)
+
+    def test_wrong_hash(self):
+        code, _, err = self.fetch(self.files(**{"a.zip": b"tampered"}))
+        self.assertEqual(code, 1)
+        self.assertIn("hash differs: a.zip", err)
+
+    def test_extra_file(self):
+        code, _, err = self.fetch(self.files(**{"evil.exe": b"x"}))
+        self.assertEqual(code, 1)
+        self.assertIn("unlisted file: evil.exe", err)
+
+    def test_sha_mismatch_with_draft(self):
+        code, _, err = self.fetch(self.files(), release=draft(sha_="c" * 40))
+        self.assertEqual(code, 1)
+        self.assertIn("differs from the draft", err)
+
+    def test_nonempty_dir_is_refused(self):
+        self.write("old.zip")
+        fake = FakeGitHub(releases=[draft()], downloads=self.files())
+        self.install(fake)
+        code, _, err = run(None, ["fetch", "--dir", str(self.dir)])
+        self.assertEqual(code, 1)
+        self.assertIn("not empty", err)
+        self.assertEqual(fake.events, [])
+
+
+class FetchResumeTest(Base):
+    """No draft: a release that published but did not finish is resumed, not refetched."""
+
+    def resume(self, fake, version="0.2.0"):
+        self.install(fake, version=version)
+        gh_out = Path(self.tmp.name) / "out.txt"
+        os.environ["GITHUB_OUTPUT"] = str(gh_out)
+        result = run(None, ["fetch", "--dir", str(self.dir)])
+        return result, gh_out
+
+    def published(self, tag="v0.2.0"):
+        return draft(tag, draft_=False, body="## notes\n")
+
+    def test_published_release_resumes_without_download(self):
+        fake = FakeGitHub(releases=[self.published()], tags=["v0.2.0"])
+        (code, out, _), gh_out = self.resume(fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(fake.events, [])
+        self.assertFalse(self.dir.exists())
+        self.assertIn("release: v0.2.0 is already published; only the bump is left", out)
+        self.assertEqual(
+            gh_out.read_text().splitlines(),
+            ["published=true", f"sha={SHA}", "version=0.2.0", "tag=v0.2.0"],
+        )
+
+    def test_annotated_tag_resolves_to_its_commit(self):
+        fake = FakeGitHub(
+            releases=[self.published()], tags=["v0.2.0"], annotated=["v0.2.0"]
+        )
+        (code, _, _), gh_out = self.resume(fake)
+        self.assertEqual(code, 0)
+        self.assertIn(f"sha={SHA}", gh_out.read_text().splitlines())
+
+    def test_current_version_not_released_still_fails(self):
+        fake = FakeGitHub(releases=[self.published("v0.1.0")], tags=["v0.1.0"])
+        (code, _, err), gh_out = self.resume(fake, version="0.2.0")
+        self.assertEqual(code, 1)
+        self.assertIn("no candidate: main has not been green since the last release", err)
+        self.assertFalse(gh_out.exists())
+
+    def test_tag_without_a_published_release_still_fails(self):
+        fake = FakeGitHub(releases=[], tags=["v0.2.0"])
+        (code, _, err), _ = self.resume(fake)
+        self.assertEqual(code, 1)
+        self.assertIn("no candidate", err)
+
+    def test_bump_after_resume_uses_the_resumed_version(self):
+        fake = FakeGitHub(releases=[self.published()], tags=["v0.2.0"])
+        (code, _, _), gh_out = self.resume(fake)
+        self.assertEqual(code, 0)
+        released = dict(l.split("=", 1) for l in gh_out.read_text().splitlines())["version"]
+        # main still carries 0.2.0 (the bump never landed): the bump behaves as usual.
+        calls = []
+        for name, func in (
+            ("git", lambda *a: calls.append(a) or ""),
+            ("mise_bump", lambda v: calls.append(("bump", v))),
+        ):
+            patcher = mock.patch.object(candidate, name, func)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        code, out, _ = run(None, ["bump", "--released", released])
+        self.assertEqual(code, 0)
+        self.assertIn(("bump", "0.2.1"), calls)
+        self.assertEqual(fake.events, [("dispatch", {"ref": "main"})])
+
+
+class PublishTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.write("a.zip", b"signed")
+        self.write("candidate.json", json.dumps({"sha": SHA, "version": "0.2.0", "files": {}}).encode())
+        self.write("NOTES.md")
+        body = f"## v0.2.0\n\n- thing\n\nCandidate: {SHA}\n{MARK}\n"
+        self.release = draft(body=body)
+
+    def test_dry_run_changes_nothing(self):
+        fake = FakeGitHub(releases=[self.release])
+        self.install(fake)
+        code, out, _ = run(None, ["publish", "--dir", str(self.dir), "--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertEqual(fake.events, [])
+        self.assertEqual(self.switch_calls, [])
+        lines = out.strip().splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertTrue(all(line.startswith("dry run: would ") for line in lines))
+
+    def test_publishes_last_and_strips_trailing_lines(self):
+        fake = FakeGitHub(releases=[self.release])
+        self.install(fake)
+        code, _, _ = run(None, ["publish", "--dir", str(self.dir)])
+        self.assertEqual(code, 0)
+        self.assertEqual(fake.events[0], ("upload", ["a.zip"]))
+        kind, body = fake.events[1]
+        self.assertEqual(kind, "patch")
+        self.assertIs(body["draft"], False)
+        self.assertEqual(body["body"], "## v0.2.0\n\n- thing\n")
+        self.assertEqual(fake.kinds(), ["upload", "patch"])
+
+    def test_shipped_runs_between_upload_and_publish(self):
+        seen = []
+        fake = FakeGitHub(releases=[self.release])
+        self.install(fake)
+        patcher = mock.patch.object(
+            candidate, "switches", lambda *a: seen.append(list(fake.kinds())) or ""
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        run(None, ["publish", "--dir", str(self.dir)])
+        self.assertEqual(seen, [["upload"]])
+
+    def test_rerun_with_tag_and_no_draft_exits_zero(self):
+        fake = FakeGitHub(releases=[], tags=["v0.2.0"])
+        self.install(fake)
+        code, out, _ = run(None, ["publish", "--dir", str(self.dir)])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), "already published: v0.2.0")
+        self.assertEqual(fake.events, [])
+
+    def test_no_draft_and_no_tag_fails(self):
+        fake = FakeGitHub()
+        self.install(fake)
+        code, _, err = run(None, ["publish", "--dir", str(self.dir)])
+        self.assertEqual(code, 1)
+        self.assertIn("nothing to publish", err)
+
+    def test_replaced_candidate_is_refused(self):
+        fake = FakeGitHub(releases=[draft(sha_="d" * 40)])
+        self.install(fake)
+        code, _, err = run(None, ["publish", "--dir", str(self.dir)])
+        self.assertEqual(code, 1)
+        self.assertIn("rerun the release", err)
+        self.assertEqual(fake.events, [])
+
+
+class BumpTest(Base):
+    def install_git(self, version, push_results=()):
+        """Patch git and the version; `push_results` lists errors (or None) per push."""
+        self.calls = []
+        self.fake = FakeGitHub()
+        pushes = list(push_results)
+        state = {"version": version}
+
+        def fake_git(*args):
+            self.calls.append(args)
+            if args[0] == "push":
+                result = pushes.pop(0) if pushes else None
+                if result:
+                    raise RuntimeError(result)
+            return ""
+
+        for target, name, func in (
+            (candidate, "git", fake_git),
+            (candidate, "mise_version", lambda: state["version"]),
+            (candidate, "mise_bump", lambda v: self.calls.append(("bump", v))),
+            (ghapi, "api", self.fake.api),
+        ):
+            patcher = mock.patch.object(target, name, func)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_skips_when_main_moved_to_another_version(self):
+        self.install_git("0.3.0")
+        code, out, _ = run(None, ["bump", "--released", "0.2.0"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), "main already carries 0.3.0; nothing to bump")
+        self.assertFalse([c for c in self.calls if c[0] in ("commit", "push", "bump")])
+        self.assertEqual(self.fake.events, [])
+
+    def test_bumps_next_patch(self):
+        self.install_git("0.2.9")
+        code, out, _ = run(None, ["bump", "--released", "0.2.9"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.splitlines()[-1], "started main for v0.2.10")
+        self.assertEqual(self.fake.events, [("dispatch", {"ref": "main"})])
+        self.assertEqual(
+            self.calls,
+            [
+                ("fetch", "origin", "main"),
+                ("checkout", "--detach", "origin/main"),
+                ("bump", "0.2.10"),
+                ("commit", "-am", "Start v0.2.10"),
+                ("push", "origin", "HEAD:main"),
+            ],
+        )
+
+    def test_retries_a_rejected_push_from_a_fresh_checkout(self):
+        self.install_git("0.2.0", push_results=["rejected", None])
+        code, _, _ = run(None, ["bump", "--released", "0.2.0"])
+        self.assertEqual(code, 0)
+        self.assertEqual(sum(c[0] == "push" for c in self.calls), 2)
+        self.assertEqual(sum(c[0] == "fetch" for c in self.calls), 2)
+        self.assertEqual(self.fake.events, [("dispatch", {"ref": "main"})])  # once, after the push
+
+    def test_a_failed_dispatch_warns_and_the_bump_still_counts(self):
+        self.install_git("0.2.0")
+
+        def no_dispatch(path, method="GET", body=None, paginate=False):
+            raise RuntimeError("HTTP 403")
+
+        with mock.patch.object(ghapi, "api", no_dispatch):
+            code, out, _ = run(None, ["bump", "--released", "0.2.0"])
+        self.assertEqual(code, 0)
+        self.assertIn("bumped main to 0.2.1", out)
+        self.assertIn("::warning title=main not started::", out)
+        self.assertNotIn("started main for", out)
+
+    def test_gives_up_after_three_attempts(self):
+        self.install_git("0.2.0", push_results=["rejected"] * 5)
+        code, _, err = run(None, ["bump", "--released", "0.2.0"])
+        self.assertEqual(code, 1)
+        self.assertEqual(sum(c[0] == "push" for c in self.calls), 3)
+        self.assertIn("3 times", err)
+        self.assertEqual(self.fake.events, [])
+
+    def test_retry_that_finds_main_already_bumped_stops(self):
+        self.install_git("0.2.0", push_results=["rejected"])
+        versions = iter(["0.2.0", "0.2.1"])
+        patcher = mock.patch.object(candidate, "mise_version", lambda: next(versions))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        code, out, _ = run(None, ["bump", "--released", "0.2.0"])
+        self.assertEqual(code, 0)
+        self.assertIn("nothing to bump", out)
+
+    def test_dry_run_touches_nothing(self):
+        self.install_git("0.2.0")
+        code, out, _ = run(None, ["bump", "--released", "0.2.0", "--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), "dry run: would bump main to 0.2.1")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.fake.events, [])
+
+    def test_non_semver_is_an_error(self):
+        self.install_git("1.0")
+        code, _, err = run(None, ["bump", "--released", "1.0"])
+        self.assertEqual(code, 1)
+        self.assertIn("x.y.z", err)
+
+
+if __name__ == "__main__":
+    unittest.main()

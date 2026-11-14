@@ -5,6 +5,7 @@ import os
 import subprocess
 
 _repo = None
+_token = False  # False: not looked up yet
 
 
 def repo():
@@ -17,10 +18,45 @@ def repo():
     return _repo
 
 
+def project_token():
+    """The token git uses for this repo's remote, or None to leave gh's own login.
+
+    `gh` has one active account; git picks a credential per remote. On a
+    machine with several GitHub accounts this makes `gh` act as the account the
+    project's git config names, with no global switch. CI sets GH_TOKEN itself.
+    """
+    global _token
+    if _token is not False:
+        return _token
+    _token = None
+    if os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"):
+        return None
+    try:
+        url = subprocess.run(
+            ["git", "remote", "get-url", "origin"], capture_output=True, text=True, timeout=10
+        ).stdout.strip()
+        if not url.startswith("https://github.com/"):
+            return None
+        # Never prompt: with no stored credential, gh's own login is the answer.
+        quiet = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
+        filled = subprocess.run(
+            ["git", "credential", "fill"], input=f"url={url}\n\n",
+            capture_output=True, text=True, timeout=10, env=quiet,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in filled.stdout.splitlines() if filled.returncode == 0 else []:
+        if line.startswith("password="):
+            _token = line.removeprefix("password=") or None
+    return _token
+
+
 def gh(*args, stdin=None, check=True):
     """Run `gh` and return its stdout. A failure raises with gh's own message."""
+    token = project_token()
+    env = {**os.environ, "GH_TOKEN": token} if token else None
     done = subprocess.run(
-        ["gh", *args], input=stdin, capture_output=True, text=True, encoding="utf-8"
+        ["gh", *args], input=stdin, capture_output=True, text=True, encoding="utf-8", env=env
     )
     if check and done.returncode != 0:
         raise RuntimeError(f"gh {' '.join(args)}: {done.stderr.strip() or done.stdout.strip()}")
