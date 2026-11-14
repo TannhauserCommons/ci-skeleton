@@ -5,6 +5,7 @@ even when GitHub cannot be reached (it then prints one `status: <message>` line)
 """
 
 import argparse
+import os
 import sys
 import unicodedata
 from datetime import datetime, timezone
@@ -15,6 +16,11 @@ CANDIDATE_MARKER = "<!-- ci:candidate -->"
 STUCK_AFTER_SECONDS = 3600
 # Gate conclusions that mean "it ran and said no", as opposed to "not green yet".
 GATE_FAILED = {"failure", "timed_out"}
+
+
+def branch():
+    """The release branch: env `CI_BRANCH`, else `main`. Empty counts as unset."""
+    return os.environ.get("CI_BRANCH", "").strip() or "main"
 
 
 def clean(text, limit=80):
@@ -35,24 +41,26 @@ def age_text(seconds):
 
 
 def main_line():
-    """`main: red  <where to look>` or `main: green`.
+    """`main: red  <where to look>` or `main: green`, named after the release branch.
 
-    Red while a `main-red` issue is open, and also when the newest finished
-    `main` run did not succeed: a run that fails at startup (a broken workflow
+    The issue is always labelled `main-red`, whatever the branch is called. Red
+    while that issue is open, and also when the newest finished `main.yml` run
+    on the branch did not succeed: a run that fails at startup (a broken workflow
     file) never reaches `after`, so no issue exists for it.
     """
+    name = branch()
     issue = ghapi.find_issue("main-red")
     if issue:
-        return f"main: red  {issue['html_url']}"
-    runs = ghapi.api("actions/workflows/main.yml/runs?branch=main&status=completed&per_page=10")
+        return f"{name}: red  {issue['html_url']}"
+    runs = ghapi.api(f"actions/workflows/main.yml/runs?branch={name}&status=completed&per_page=10")
     for run in (runs or {}).get("workflow_runs", []):
         # Cancelled is neither red nor green: the run before it still stands.
         if run.get("conclusion") in ("cancelled", "skipped"):
             continue
         if run.get("conclusion") != "success":
-            return f"main: red  {run['conclusion']}  {run['html_url']}"
+            return f"{name}: red  {run['conclusion']}  {run['html_url']}"
         break
-    return "main: green"
+    return f"{name}: green"
 
 
 def gate_run(sha):

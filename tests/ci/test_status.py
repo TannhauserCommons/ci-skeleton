@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import os
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -47,7 +48,7 @@ class FakeGitHub:
         if path.startswith("commits/") and "/check-runs" in path:
             sha = path.split("/")[1]
             return {"check_runs": self.checks.get(sha, [])}
-        if path.startswith("actions/workflows/main.yml/runs?branch=main&status=completed"):
+        if path.startswith("actions/workflows/main.yml/runs?") and "&status=completed" in path:
             return {"workflow_runs": self.runs}
         if path.startswith("releases"):
             return self.releases
@@ -67,6 +68,13 @@ def run_status(fake):
 
 
 class StatusTests(unittest.TestCase):
+    def setUp(self):
+        # The tests must not depend on the CI_BRANCH of whoever runs them.
+        patch = mock.patch.dict(os.environ)
+        patch.start()
+        self.addCleanup(patch.stop)
+        os.environ.pop("CI_BRANCH", None)
+
     def lines(self, fake):
         with mock.patch.object(status, "datetime") as clock:
             clock.now.return_value = NOW
@@ -91,6 +99,30 @@ class StatusTests(unittest.TestCase):
                          "main: green")
         self.assertEqual(self.lines(FakeGitHub(runs=["cancelled", "failure"]))[0],
                          "main: red  failure  https://x/runs/1")
+
+    def test_main_query_uses_main_when_ci_branch_is_unset_or_empty(self):
+        for value in (None, "", "  "):
+            with self.subTest(value=value):
+                if value is not None:
+                    os.environ["CI_BRANCH"] = value
+                fake = FakeGitHub()
+                self.assertEqual(self.lines(fake)[0], "main: green")
+                self.assertIn("actions/workflows/main.yml/runs?branch=main&status=completed&per_page=10",
+                              fake.requested)
+
+    def test_release_branch_names_the_line_and_the_query(self):
+        os.environ["CI_BRANCH"] = "next"
+        fake = FakeGitHub()
+        self.assertEqual(self.lines(fake)[0], "next: green")
+        self.assertIn("actions/workflows/main.yml/runs?branch=next&status=completed&per_page=10",
+                      fake.requested)
+        self.assertFalse(any("branch=main" in p for p in fake.requested))
+
+    def test_release_branch_red_lines(self):
+        os.environ["CI_BRANCH"] = "next"
+        red = {"number": 3, "html_url": "https://x/3"}
+        self.assertEqual(self.lines(FakeGitHub(red=red))[0], "next: red  https://x/3")
+        self.assertEqual(self.lines(FakeGitHub(runs=["failure"]))[0], "next: red  failure  https://x/runs/0")
 
     def test_pr_with_failed_gate(self):
         p = pr(12, "Break things")

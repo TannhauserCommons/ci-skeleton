@@ -10,6 +10,10 @@ on:
         description: Fetch, sign and check, but publish nothing
         type: boolean
         default: false
+      notes:
+        description: A note to put at the top of the release text (optional)
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -35,8 +39,10 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+      RELEASE_NOTES: ${{ inputs.notes }}
       # Checked first, dry run included: without the key the release would
-      # publish and only then fail to move main on.
+      # publish and only then fail to move main on. A project whose version is
+      # bumped elsewhere removes this line and the ci:bump step.
       BUMP_KEY_SET: ${{ secrets.BUMP_KEY != '' }}
     steps:
       # The release scripts run from main. The deploy key makes the bump push

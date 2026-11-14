@@ -37,6 +37,7 @@ class FakeGitHub:
         self.events = []
 
     def api(self, path, method="GET", body=None, paginate=False):
+        self.paths = getattr(self, "paths", []) + [path]
         if method == "GET" and path.startswith("releases?"):
             return self.releases
         if method == "GET" and path.startswith("git/matching-refs/tags/"):
@@ -225,6 +226,14 @@ class NotesTest(unittest.TestCase):
         self.assertIn("No changes since v0.1.0.", notes)
         self.assertNotIn("###", notes)
 
+    def test_no_changes_line_is_left_out_when_other_notes_exist(self):
+        for kwargs in ({"switch_notes": "### Switches\n- shout"}, {"extra_notes": "perf table"}):
+            notes = candidate.build_notes("0.2.0", SHA, "v0.1.0", [], **kwargs)
+            self.assertNotIn("No changes", notes)
+            self.assertTrue(notes.startswith("## v0.2.0\n\n"))
+        blank = candidate.build_notes("0.2.0", SHA, "v0.1.0", [], "  \n", "\n")
+        self.assertIn("No changes since v0.1.0.", blank)
+
     def test_switches_and_notes_md_are_appended_and_marker_is_last(self):
         notes = candidate.build_notes(
             "0.2.0", SHA, None, ["cli: a"], "### Switches\n- shout\n", "perf table\n"
@@ -252,13 +261,25 @@ class NotesTest(unittest.TestCase):
 
 
 class SubjectsTest(unittest.TestCase):
-    def test_the_release_bump_commit_is_left_out_of_the_notes(self):
-        log = "cli: add flag\nStart v0.2.1\nStart the engine sooner\n"
+    def subjects(self, log, version):
         with mock.patch.object(candidate, "git", lambda *args: log):
-            self.assertEqual(
-                candidate.commit_subjects(SHA, "v0.2.0"),
-                ["cli: add flag", "Start the engine sooner"],
-            )
+            return candidate.commit_subjects(SHA, "v0.1.0", version)
+
+    def test_subjects_that_only_name_the_version_are_left_out(self):
+        log = (
+            "cli: add flag\nStart v0.2.0\nKiku v0.2.0\nRelease 0.2.0\n"
+            "Start the engine sooner\n"
+        )
+        self.assertEqual(
+            self.subjects(log, "0.2.0"), ["cli: add flag", "Start the engine sooner"]
+        )
+
+    def test_another_version_or_more_words_are_listed(self):
+        log = "Start v0.1.1\nPrepare for the 0.2.0\nStart v0.2.01\nStart v0.2.0 properly\n"
+        self.assertEqual(self.subjects(log, "0.2.0"), log.splitlines())
+
+    def test_the_dot_in_the_version_is_literal(self):
+        self.assertEqual(self.subjects("Start v0x2x0\n", "0.2.0"), ["Start v0x2x0"])
 
 
 class DraftTest(Base):
@@ -280,6 +301,20 @@ class DraftTest(Base):
         )
         self.install(fake)
         self.assertEqual(candidate.standing_draft()["id"], 3)
+
+    def test_base_asks_for_the_release_branch(self):
+        for value, expected in ((None, "main"), ("", "main"), ("  ", "main"), (" next ", "next")):
+            with self.subTest(value=value):
+                os.environ.pop("CI_BRANCH", None)
+                if value is not None:
+                    os.environ["CI_BRANCH"] = value
+                fake = FakeGitHub()
+                self.install(fake)
+                run(candidate.cmd_base, None)
+                self.assertEqual(
+                    fake.paths,
+                    [f"actions/workflows/main.yml/runs?branch={expected}&status=success&per_page=1"],
+                )
 
     def test_base_outputs_head_sha_or_nothing(self):
         gh_out = Path(self.tmp.name) / "out.txt"
@@ -649,6 +684,32 @@ class FetchTest(Base):
         self.assertEqual(code, 1)
         self.assertIn("signed.json sha", err)
 
+    def test_release_branch_is_named_by_ci_branch(self):
+        os.environ["CI_BRANCH"] = "next"
+        code, _, err = self.fetch(self.files())
+        self.assertEqual(code, 0, err)
+        self.assertIn(("fetch", "origin", "next"), self.git_calls)
+        self.assertIn(("merge-base", "--is-ancestor", SHA, "origin/next"), self.git_calls)
+
+    def test_candidate_not_on_the_named_branch_fails(self):
+        os.environ["CI_BRANCH"] = "next"
+        self.is_ancestor = False
+        code, _, err = self.fetch(self.files())
+        self.assertEqual(code, 1)
+        self.assertIn(f"the candidate {SHA[:7]} is not on next", err)
+
+    def test_bump_key_variable_absent_false_and_true(self):
+        for value, ok in ((None, True), ("true", True), ("false", False), ("", False)):
+            with self.subTest(value=value):
+                os.environ.pop("BUMP_KEY_SET", None)
+                if value is not None:
+                    os.environ["BUMP_KEY_SET"] = value
+                shutil.rmtree(self.tree, ignore_errors=True)
+                code, _, err = self.fetch(self.files())
+                self.assertEqual(code == 0, ok, err)
+                if not ok:
+                    self.assertIn("BUMP_KEY is not set", err)
+
     def test_candidate_not_on_main_fails(self):
         self.is_ancestor = False
         code, _, err = self.fetch(self.files())
@@ -671,10 +732,8 @@ class BumpKeyGateTest(Base):
                     patcher = mock.patch.object(ghapi, name, api)
                     patcher.start()
                     self.addCleanup(patcher.stop)
-                for value in (None, "false"):
-                    os.environ.pop("BUMP_KEY_SET", None)
-                    if value:
-                        os.environ["BUMP_KEY_SET"] = value
+                for value in ("false", ""):
+                    os.environ["BUMP_KEY_SET"] = value
                     code, _, err = run(None, ["fetch", "--tree", str(self.tree)])
                     self.assertEqual(code, 1)
                     self.assertIn("BUMP_KEY is not set", err)
@@ -836,6 +895,35 @@ class PublishTest(Base):
         self.assertEqual(
             sorted(e[1] for e in fake.events[3:]), ["candidate.json", "signed.json"]
         )
+
+    def publish_body(self, **env):
+        fake = FakeGitHub(releases=[self.release])
+        self.install(fake)
+        with mock.patch.dict(os.environ, env):
+            code, _, err = run(None, ["publish", "--dir", str(self.dir)])
+        self.assertEqual(code, 0, err)
+        return next(e[1]["body"] for e in fake.events if e[0] == "patch")
+
+    def test_release_note_is_the_paragraph_after_the_heading(self):
+        body = self.publish_body(RELEASE_NOTES="  Big *change*: read me.\nSecond line.\n\n")
+        self.assertEqual(
+            body, "## v0.2.0\n\nBig *change*: read me.\nSecond line.\n\n- thing\n"
+        )
+
+    def test_no_release_note_leaves_the_body_alone(self):
+        plain = "## v0.2.0\n\n- thing\n"
+        self.assertEqual(self.publish_body(), plain)
+        self.assertEqual(self.publish_body(RELEASE_NOTES=""), plain)
+        self.assertEqual(self.publish_body(RELEASE_NOTES=" \n\t\n"), plain)
+
+    def test_dry_run_reports_the_release_note(self):
+        fake = FakeGitHub(releases=[self.release])
+        self.install(fake)
+        with mock.patch.dict(os.environ, {"RELEASE_NOTES": "  hello there \n"}):
+            code, out, _ = run(None, ["publish", "--dir", str(self.dir), "--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertIn("dry run: would add the release note (11 characters)", out.splitlines())
+        self.assertEqual(fake.events, [])
 
     def test_signed_manifest_records_the_files_as_they_are_now(self):
         fake = FakeGitHub(releases=[self.release])
@@ -1027,6 +1115,36 @@ class BumpTest(Base):
                 self.assertIn("BUMP_KEY is not set", err)
                 self.assertEqual(self.calls, [])
                 self.assertEqual(self.fake.events, [])
+
+    def test_release_branch_is_named_by_ci_branch(self):
+        os.environ["CI_BRANCH"] = "next"
+        self.install_git("0.2.0")
+        code, out, _ = run(None, ["bump", "--released", "0.2.0"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), "bumped next to 0.2.1")
+        self.assertIn(("fetch", "origin", "next"), self.calls)
+        self.assertIn(("checkout", "--detach", "origin/next"), self.calls)
+        self.assertIn(("push", "origin", "HEAD:next"), self.calls)
+        self.assertFalse([c for c in self.calls if "main" in c or "origin/main" in c])
+
+    def test_branch_name_in_the_skip_and_dry_run_messages(self):
+        os.environ["CI_BRANCH"] = "next"
+        self.install_git("0.3.0")
+        self.assertEqual(
+            run(None, ["bump", "--released", "0.2.0"])[1].strip(),
+            "next already carries 0.3.0; nothing to bump",
+        )
+        self.install_git("0.2.0")
+        self.assertEqual(
+            run(None, ["bump", "--released", "0.2.0", "--dry-run"])[1].strip(),
+            "dry run: would bump next to 0.2.1",
+        )
+
+    def test_empty_ci_branch_means_main(self):
+        os.environ["CI_BRANCH"] = ""
+        self.install_git("0.2.0")
+        run(None, ["bump", "--released", "0.2.0"])
+        self.assertIn(("push", "origin", "HEAD:main"), self.calls)
 
     def test_dry_run_needs_no_key(self):
         self.install_git("0.2.0")

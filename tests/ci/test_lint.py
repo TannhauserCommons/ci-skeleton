@@ -302,8 +302,8 @@ class PermissionsTest(unittest.TestCase):
 
 class MiseActionTest(unittest.TestCase):
     MESSAGE = (
-        "jdx/mise-action must set cache_save to false or to ${{ github.ref == 'refs/heads/main' }}"
-        " (only main saves caches)"
+        "jdx/mise-action must set cache_save to false or to a comparison of github.ref "
+        "with the release branch (only the release branch saves caches)"
     )
     MAIN = "${{ github.ref == 'refs/heads/main' }}"
 
@@ -325,14 +325,40 @@ class MiseActionTest(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(findings(self.with_value(value)), [])
 
+    def test_release_branch_comparisons_pass(self):
+        for expression in (
+            "github.ref == 'refs/heads/next'",
+            "github.ref == 'refs/heads/release/1.x_a-b'",
+            "github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next'",
+            "github.ref == 'refs/heads/a' || github.ref == 'refs/heads/b' || github.ref == 'refs/heads/c'",
+            "github.ref=='refs/heads/main'",
+            "  github.ref  ==  'refs/heads/main'  ",
+            "github.ref == 'refs/heads/main'||github.ref == 'refs/heads/next'",
+        ):
+            with self.subTest(expression=expression):
+                self.assertEqual(findings(self.with_value("${{" + expression + "}}")), [])
+                self.assertEqual(findings(self.with_value(f'"${{{{ {expression} }}}}"')), [])
+
     def test_any_other_value_is_a_finding(self):
         for value in (
             "true",
             "'true'",
-            "${{ github.ref == 'refs/heads/dev' }}",
             "${{ github.event_name == 'push' }}",
+            "${{ github.ref_name == 'main' }}",
             "${{ github.ref != 'refs/heads/main' }}",
+            "${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}",
+            "${{ github.ref == 'refs/heads/main' && github.ref == 'refs/heads/next' }}",
+            "${{ github.ref == 'refs/heads/main' || github.event_name == 'push' }}",
+            "${{ github.ref == 'refs/heads/main' || }}",
+            "${{ startsWith(github.ref, 'refs/heads/') }}",
+            "${{ github.ref }}",
+            "${{ github.ref == 'refs/tags/v1' }}",
+            "${{ github.ref == 'refs/pull/1/merge' }}",
+            "${{ github.ref == 'refs/heads/' }}",
+            "${{ github.ref == 'refs/heads/a b' }}",
+            "${{ github.ref == 'refs/heads/main' }} && true",
             "${{ true }}",
+            "refs/heads/main",
             "False",
             "",
             "0",
@@ -349,6 +375,7 @@ class MiseActionTest(unittest.TestCase):
             "{version: x, cache_save: false}",
             "{ cache_save: false, version: x }",
             f"{{version: x, cache_save: {self.MAIN}}}",
+            "{cache_save: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}}",
             f"{{cache_save: {self.MAIN}, version: x}}",
             "{version: x, 'cache_save': 'false'}",
         ):
