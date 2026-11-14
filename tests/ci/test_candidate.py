@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -112,12 +113,26 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.dir = Path(self.tmp.name) / "dist"
+        self.dir = Path(self.tmp.name) / "candidate" / "dist"
         env = mock.patch.dict(os.environ, {}, clear=False)
         env.start()
         self.addCleanup(env.stop)
-        for key in ("GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_OUTPUT"):
+        for key in ("GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_OUTPUT", "BUMP_KEY_SET"):
             os.environ.pop(key, None)
+        self.is_ancestor = True
+        self.tree = Path(self.tmp.name) / "candidate"
+        self.tracked_dist = False  # a worktree that already holds a non-empty dist/
+        self.scratch_dirs = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def mkdtemp(*a, **k):
+            made = real_mkdtemp(*a, **k)
+            self.scratch_dirs.append(Path(made))
+            return made
+
+        patcher = mock.patch.object(tempfile, "mkdtemp", mkdtemp)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def install(self, fake, version="0.2.0", switch_notes="", git=None):
         """Patch every outside call; returns the git calls list."""
@@ -128,6 +143,17 @@ class Base(unittest.TestCase):
             self.git_calls.append(args)
             if args[0] == "rev-parse":
                 return SHA + "\n"
+            if args[:2] == ("worktree", "add"):
+                # The real call checks the commit out; the tests only need the directory.
+                tree = Path(args[3])
+                tree.mkdir(parents=True)
+                if self.tracked_dist:
+                    (tree / "dist").mkdir()
+                    (tree / "dist" / "keep.txt").write_text("tracked")
+                return ""
+            if args[:2] == ("worktree", "remove"):
+                shutil.rmtree(args[-1])
+                return ""
             if args[0] == "describe":
                 raise RuntimeError("no tags")
             if args[0] == "log":
@@ -136,7 +162,14 @@ class Base(unittest.TestCase):
 
         for target, value in (
             (ghapi, {"api": fake.api, "gh": fake.gh}),
-            (candidate, {"git": git or fake_git, "mise_version": lambda: version}),
+            (
+                candidate,
+                {
+                    "git": git or fake_git,
+                    "git_ok": lambda *a: self.git_calls.append(a) or self.is_ancestor,
+                    "mise_version": lambda: version,
+                },
+            ),
         ):
             for name, func in value.items():
                 patcher = mock.patch.object(target, name, func)
@@ -231,7 +264,7 @@ class DraftTest(Base):
     def test_two_marked_drafts_is_an_error_naming_them(self):
         fake = FakeGitHub(releases=[draft("v0.2.0", id_=1), draft("v0.3.0", id_=2)])
         self.install(fake)
-        code, _, err = run(None, ["fetch", "--dir", str(self.dir)])
+        code, _, err = run(None, ["fetch", "--tree", str(self.tree)])
         self.assertEqual(code, 1)
         self.assertIn("v0.2.0", err)
         self.assertIn("v0.3.0", err)
@@ -378,6 +411,25 @@ class RecordTest(Base):
         self.assertEqual(fake.events[0][1]["target_commitish"], SHA)
         self.assertNotIn("create", fake.kinds())
 
+    def test_stale_signed_manifest_asset_is_removed_after_candidate_json(self):
+        self.write("a.zip")
+        self.write("signed.json", b"{}")  # a leftover in the dir is not a release file
+        fake = FakeGitHub(
+            releases=[draft("v0.2.0")],
+            assets=[
+                {"id": 1, "name": "a.zip"},
+                {"id": 2, "name": "signed.json"},
+                {"id": 3, "name": "candidate.json"},
+            ],
+        )
+        self.install(fake)
+        code, _, _ = run(None, self.args())
+        self.assertEqual(code, 0)
+        deletes = [e[1] for e in fake.events if e[0] == "delete"]
+        self.assertEqual(deletes[0], "candidate.json")
+        self.assertIn("signed.json", deletes)
+        self.assertEqual(fake.events[-2:], [("upload", ["a.zip"]), ("upload", ["candidate.json"])])
+
     def test_last_tag_bounds_the_log(self):
         self.write("a.zip")
 
@@ -416,7 +468,7 @@ class FetchTest(Base):
     def fetch(self, downloads, release=None):
         fake = FakeGitHub(releases=[release or draft()], downloads=downloads)
         self.install(fake)
-        return run(None, ["fetch", "--dir", str(self.dir)])
+        return run(None, ["fetch", "--tree", str(self.tree)])
 
     def test_passes_and_outputs(self):
         gh_out = Path(self.tmp.name) / "out.txt"
@@ -429,9 +481,53 @@ class FetchTest(Base):
         )
         self.assertIn("tag=v0.2.0", out)
 
+    def test_worktree_at_the_candidate_with_files_and_manifest_in_dist(self):
+        signed = {"a.zip": b"A-signed"}
+        downloads = self.files(**{"signed.json": self.signed(signed)})
+        code, _, err = self.fetch(downloads)
+        self.assertEqual(code, 0, err)
+        self.assertIn(("worktree", "add", "--detach", str(self.tree), SHA), self.git_calls)
+        self.assertEqual(
+            sorted(p.name for p in self.dir.iterdir()), ["a.zip", "b.zip", "candidate.json"]
+        )
+        self.assertEqual((self.dir / "a.zip").read_bytes(), b"aaa")
+        self.assertTrue(all(not d.exists() for d in self.scratch_dirs))
+        self.assertEqual(len(self.scratch_dirs), 1)
+
+    def test_failed_verification_leaves_no_worktree_and_no_scratch_dir(self):
+        code, _, _ = self.fetch(self.files(**{"a.zip": b"tampered"}))
+        self.assertEqual(code, 1)
+        self.assertFalse(self.tree.exists())
+        self.assertFalse([c for c in self.git_calls if c[0] == "worktree"])
+        self.assertTrue(self.scratch_dirs)
+        self.assertTrue(all(not d.exists() for d in self.scratch_dirs))
+
+    def test_download_failure_removes_the_scratch_dir(self):
+        fake = FakeGitHub(releases=[draft()])
+        fake.gh = mock.Mock(side_effect=RuntimeError("network"))
+        self.install(fake)
+        code, _, _ = run(None, ["fetch", "--tree", str(self.tree)])
+        self.assertEqual(code, 1)
+        self.assertTrue(all(not d.exists() for d in self.scratch_dirs))
+
+    def test_existing_tree_is_refused(self):
+        self.tree.mkdir()
+        code, _, err = self.fetch(self.files())
+        self.assertEqual(code, 1)
+        self.assertIn(f"{self.tree} already exists; remove it and run fetch again", err)
+        self.assertFalse([c for c in self.git_calls if c[0] == "worktree"])
+        self.assertTrue(all(not d.exists() for d in self.scratch_dirs))
+
+    def test_tracked_nonempty_dist_is_refused_and_the_worktree_removed(self):
+        self.tracked_dist = True
+        code, _, err = self.fetch(self.files())
+        self.assertEqual(code, 1)
+        self.assertIn("commits a dist/ folder", err)
+        self.assertFalse(self.tree.exists())
+
     def test_no_candidate(self):
         self.install(FakeGitHub())
-        code, _, err = run(None, ["fetch", "--dir", str(self.dir)])
+        code, _, err = run(None, ["fetch", "--tree", str(self.tree)])
         self.assertEqual(code, 1)
         self.assertIn("no candidate: main has not been green since the last release", err)
 
@@ -460,14 +556,64 @@ class FetchTest(Base):
         self.assertEqual(code, 1)
         self.assertIn("differs from the draft", err)
 
-    def test_nonempty_dir_is_refused(self):
-        self.write("old.zip")
-        fake = FakeGitHub(releases=[draft()], downloads=self.files())
-        self.install(fake)
-        code, _, err = run(None, ["fetch", "--dir", str(self.dir)])
+    def signed(self, files, sha_=SHA):
+        return json.dumps({"sha": sha_, "files": {n: sha(d) for n, d in files.items()}}).encode()
+
+    def test_all_files_signed(self):
+        signed = {"a.zip": b"A-signed", "b.zip": b"B-signed", "a.zip.sha256": b"sum"}
+        downloads = self.files(**signed, **{"signed.json": self.signed(signed)})
+        code, _, err = self.fetch(downloads)
+        self.assertEqual(code, 0, err)
+        self.assertFalse((self.dir / "signed.json").exists())
+
+    def test_partly_signed_with_a_signed_file_missing_from_the_draft(self):
+        # a.zip got replaced, b.zip not yet; the signature file never made it up.
+        signed = {"a.zip": b"A-signed", "b.zip": b"B-signed", "a.zip.sha256": b"sum"}
+        downloads = self.files(**{"a.zip": b"A-signed", "signed.json": self.signed(signed)})
+        code, _, err = self.fetch(downloads)
+        self.assertEqual(code, 0, err)
+        self.assertFalse((self.dir / "signed.json").exists())
+        self.assertEqual((self.dir / "a.zip").read_bytes(), b"A-signed")
+        self.assertEqual((self.dir / "b.zip").read_bytes(), b"bbb")
+
+    def test_file_matching_neither_hash_fails(self):
+        signed = {"a.zip": b"A-signed"}
+        downloads = self.files(**{"a.zip": b"other", "signed.json": self.signed(signed)})
+        code, _, err = self.fetch(downloads)
         self.assertEqual(code, 1)
-        self.assertIn("not empty", err)
-        self.assertEqual(fake.events, [])
+        self.assertIn("hash differs: a.zip", err)
+
+    def test_listed_file_missing_still_fails_with_signed_manifest(self):
+        downloads = self.files(**{"b.zip": None, "signed.json": self.signed({"b.zip": b"B-signed"})})
+        code, _, err = self.fetch(downloads)
+        self.assertEqual(code, 1)
+        self.assertIn("missing file: b.zip", err)
+
+    def test_extra_file_not_in_signed_manifest_fails(self):
+        downloads = self.files(**{"evil.exe": b"x", "signed.json": self.signed({"a.zip": b"A-signed"})})
+        code, _, err = self.fetch(downloads)
+        self.assertEqual(code, 1)
+        self.assertIn("unlisted file: evil.exe", err)
+
+    def test_extra_file_with_the_wrong_signed_hash_fails(self):
+        downloads = self.files(**{"x.sha256": b"changed", "signed.json": self.signed({"x.sha256": b"sum"})})
+        code, _, err = self.fetch(downloads)
+        self.assertEqual(code, 1)
+        self.assertIn("hash differs: x.sha256", err)
+
+    def test_signed_manifest_for_another_commit_fails(self):
+        downloads = self.files(**{"signed.json": self.signed({}, sha_="c" * 40)})
+        code, _, err = self.fetch(downloads)
+        self.assertEqual(code, 1)
+        self.assertIn("signed.json sha", err)
+
+    def test_candidate_not_on_main_fails(self):
+        self.is_ancestor = False
+        code, _, err = self.fetch(self.files())
+        self.assertEqual(code, 1)
+        self.assertIn(f"the candidate {SHA[:7]} is not on main", err)
+        self.assertIn(("fetch", "origin", "main"), self.git_calls)
+        self.assertIn(("merge-base", "--is-ancestor", SHA, "origin/main"), self.git_calls)
 
 
 class FetchResumeTest(Base):
@@ -477,7 +623,7 @@ class FetchResumeTest(Base):
         self.install(fake, version=version)
         gh_out = Path(self.tmp.name) / "out.txt"
         os.environ["GITHUB_OUTPUT"] = str(gh_out)
-        result = run(None, ["fetch", "--dir", str(self.dir)])
+        result = run(None, ["fetch", "--tree", str(self.tree)])
         return result, gh_out
 
     def published(self, tag="v0.2.0"):
@@ -488,7 +634,8 @@ class FetchResumeTest(Base):
         (code, out, _), gh_out = self.resume(fake)
         self.assertEqual(code, 0)
         self.assertEqual(fake.events, [])
-        self.assertFalse(self.dir.exists())
+        self.assertFalse(self.tree.exists())
+        self.assertEqual(self.scratch_dirs, [])
         self.assertIn("release: v0.2.0 is already published; only the bump is left", out)
         self.assertEqual(
             gh_out.read_text().splitlines(),
@@ -522,6 +669,7 @@ class FetchResumeTest(Base):
         self.assertEqual(code, 0)
         released = dict(l.split("=", 1) for l in gh_out.read_text().splitlines())["version"]
         # main still carries 0.2.0 (the bump never landed): the bump behaves as usual.
+        os.environ["BUMP_KEY_SET"] = "true"
         calls = []
         for name, func in (
             ("git", lambda *a: calls.append(a) or ""),
@@ -533,7 +681,7 @@ class FetchResumeTest(Base):
         code, out, _ = run(None, ["bump", "--released", released])
         self.assertEqual(code, 0)
         self.assertIn(("bump", "0.2.1"), calls)
-        self.assertEqual(fake.events, [("dispatch", {"ref": "main"})])
+        self.assertEqual(fake.events, [])
 
 
 class PublishTest(Base):
@@ -553,20 +701,63 @@ class PublishTest(Base):
         self.assertEqual(fake.events, [])
         self.assertEqual(self.switch_calls, [])
         lines = out.strip().splitlines()
-        self.assertEqual(len(lines), 3)
+        self.assertEqual(len(lines), 4)
         self.assertTrue(all(line.startswith("dry run: would ") for line in lines))
+        self.assertFalse((self.dir / "signed.json").exists())
+
+    MANIFEST_ASSETS = [
+        {"id": 1, "name": "candidate.json"},
+        {"id": 2, "name": "a.zip"},
+        {"id": 3, "name": "signed.json"},
+    ]
 
     def test_publishes_last_and_strips_trailing_lines(self):
-        fake = FakeGitHub(releases=[self.release])
+        fake = FakeGitHub(releases=[self.release], assets=self.MANIFEST_ASSETS)
         self.install(fake)
         code, _, _ = run(None, ["publish", "--dir", str(self.dir)])
         self.assertEqual(code, 0)
-        self.assertEqual(fake.events[0], ("upload", ["a.zip"]))
-        kind, body = fake.events[1]
+        self.assertEqual(fake.events[0], ("upload", ["signed.json"]))
+        self.assertEqual(fake.events[1], ("upload", ["a.zip"]))
+        kind, body = fake.events[2]
         self.assertEqual(kind, "patch")
         self.assertIs(body["draft"], False)
         self.assertEqual(body["body"], "## v0.2.0\n\n- thing\n")
-        self.assertEqual(fake.kinds(), ["upload", "patch"])
+        self.assertEqual(fake.kinds(), ["upload", "upload", "patch", "delete", "delete"])
+        self.assertEqual(
+            sorted(e[1] for e in fake.events[3:]), ["candidate.json", "signed.json"]
+        )
+
+    def test_signed_manifest_records_the_files_as_they_are_now(self):
+        fake = FakeGitHub(releases=[self.release])
+        self.install(fake)
+        run(None, ["publish", "--dir", str(self.dir)])
+        signed = json.loads((self.dir / "signed.json").read_text())
+        self.assertEqual(signed, {"sha": SHA, "files": {"a.zip": sha(b"signed")}})
+
+    def test_failed_manifest_cleanup_only_warns(self):
+        class Stubborn(FakeGitHub):
+            def api(self, path, method="GET", body=None, paginate=False):
+                if method == "DELETE":
+                    raise RuntimeError("HTTP 500")
+                return super().api(path, method, body, paginate)
+
+        fake = Stubborn(releases=[self.release], assets=self.MANIFEST_ASSETS)
+        self.install(fake)
+        code, out, _ = run(None, ["publish", "--dir", str(self.dir)])
+        self.assertEqual(code, 0)
+        self.assertIn("::warning", out)
+        self.assertIn("published: v0.2.0", out)
+        self.assertIn("patch", fake.kinds())
+
+    def test_a_failure_before_the_patch_leaves_nothing_deleted(self):
+        fake = FakeGitHub(releases=[self.release], assets=self.MANIFEST_ASSETS)
+        self.install(fake)
+        mock.patch.object(candidate, "switches", mock.Mock(side_effect=RuntimeError("boom"))).start()
+        self.addCleanup(mock.patch.stopall)
+        code, _, err = run(None, ["publish", "--dir", str(self.dir)])
+        self.assertEqual(code, 1)
+        self.assertNotIn("patch", fake.kinds())
+        self.assertNotIn("delete", fake.kinds())
 
     def test_shipped_runs_between_upload_and_publish(self):
         seen = []
@@ -578,7 +769,7 @@ class PublishTest(Base):
         patcher.start()
         self.addCleanup(patcher.stop)
         run(None, ["publish", "--dir", str(self.dir)])
-        self.assertEqual(seen, [["upload"]])
+        self.assertEqual(seen, [["upload", "upload"]])
 
     def test_rerun_with_tag_and_no_draft_exits_zero(self):
         fake = FakeGitHub(releases=[], tags=["v0.2.0"])
@@ -605,6 +796,10 @@ class PublishTest(Base):
 
 
 class BumpTest(Base):
+    def setUp(self):
+        super().setUp()
+        os.environ["BUMP_KEY_SET"] = "true"
+
     def install_git(self, version, push_results=()):
         """Patch git and the version; `push_results` lists errors (or None) per push."""
         self.calls = []
@@ -642,8 +837,8 @@ class BumpTest(Base):
         self.install_git("0.2.9")
         code, out, _ = run(None, ["bump", "--released", "0.2.9"])
         self.assertEqual(code, 0)
-        self.assertEqual(out.splitlines()[-1], "started main for v0.2.10")
-        self.assertEqual(self.fake.events, [("dispatch", {"ref": "main"})])
+        self.assertEqual(out.splitlines()[-1], "bumped main to 0.2.10")
+        self.assertEqual(self.fake.events, [])  # the deploy key's push starts main itself
         self.assertEqual(
             self.calls,
             [
@@ -661,20 +856,27 @@ class BumpTest(Base):
         self.assertEqual(code, 0)
         self.assertEqual(sum(c[0] == "push" for c in self.calls), 2)
         self.assertEqual(sum(c[0] == "fetch" for c in self.calls), 2)
-        self.assertEqual(self.fake.events, [("dispatch", {"ref": "main"})])  # once, after the push
+        self.assertEqual(self.fake.events, [])
 
-    def test_a_failed_dispatch_warns_and_the_bump_still_counts(self):
+    def test_refuses_without_the_deploy_key(self):
+        for value in (None, "", "false", "True"):
+            with self.subTest(value=value):
+                self.install_git("0.2.0")
+                os.environ.pop("BUMP_KEY_SET", None)
+                if value is not None:
+                    os.environ["BUMP_KEY_SET"] = value
+                code, _, err = run(None, ["bump", "--released", "0.2.0"])
+                self.assertEqual(code, 1)
+                self.assertIn("BUMP_KEY is not set", err)
+                self.assertEqual(self.calls, [])
+                self.assertEqual(self.fake.events, [])
+
+    def test_dry_run_needs_no_key(self):
         self.install_git("0.2.0")
-
-        def no_dispatch(path, method="GET", body=None, paginate=False):
-            raise RuntimeError("HTTP 403")
-
-        with mock.patch.object(ghapi, "api", no_dispatch):
-            code, out, _ = run(None, ["bump", "--released", "0.2.0"])
+        os.environ.pop("BUMP_KEY_SET")
+        code, out, _ = run(None, ["bump", "--released", "0.2.0", "--dry-run"])
         self.assertEqual(code, 0)
-        self.assertIn("bumped main to 0.2.1", out)
-        self.assertIn("::warning title=main not started::", out)
-        self.assertNotIn("started main for", out)
+        self.assertIn("dry run: would bump main to 0.2.1", out)
 
     def test_gives_up_after_three_attempts(self):
         self.install_git("0.2.0", push_results=["rejected"] * 5)

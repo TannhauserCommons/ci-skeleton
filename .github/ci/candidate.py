@@ -13,14 +13,18 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import ghapi
 
 # Ends the body of the one draft release that holds the candidate.
 MARKER = "<!-- ci:candidate -->"
-# Files of dist/ that are never assets: the manifest is handled apart, the notes become the body.
-NOT_ASSETS = ("candidate.json", "NOTES.md")
+# Files of the release dir that are never release files: the manifests are handled apart,
+# the notes become the body.
+CANDIDATE_JSON = "candidate.json"  # what record built: name -> hash before signing
+SIGNED_JSON = "signed.json"  # what publish uploaded: name -> hash after signing
+NOT_ASSETS = (CANDIDATE_JSON, SIGNED_JSON, "NOTES.md")
 # GitHub rewrites asset names it dislikes (spaces become dots, ...), which would break
 # the name -> hash map, so record refuses names it would not keep as they are.
 SAFE_NAME = re.compile(r"[A-Za-z0-9_+-][A-Za-z0-9._+-]*")
@@ -42,6 +46,12 @@ def git(*args):
     if done.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {done.stderr.strip() or done.stdout.strip()}")
     return done.stdout
+
+
+def git_ok(*args):
+    """Whether a git command exits 0. For yes/no questions (`merge-base --is-ancestor`),
+    so a "no" is never mistaken for an error by parsing its text."""
+    return subprocess.run(["git", *args], capture_output=True).returncode == 0
 
 
 def mise_version():
@@ -269,7 +279,9 @@ def replace_assets(draft, tag, files, manifest_path):
     The manifest goes first on the way out and last on the way in: with no manifest
     on the draft, `fetch` refuses, so a crash in between costs a rerun only.
     """
-    old = sorted(draft_assets(draft["id"]), key=lambda a: a["name"] != "candidate.json")
+    # Every old asset goes, a stale signed.json included: it would make `fetch`
+    # accept signed hashes that belong to a different candidate.
+    old = sorted(draft_assets(draft["id"]), key=lambda a: a["name"] != CANDIDATE_JSON)
     for asset in old:
         ghapi.api(f"releases/assets/{asset['id']}", "DELETE")
     if files:
@@ -341,38 +353,70 @@ def cmd_record(args):
     return 0
 
 
+def read_signed(root, candidate_sha):
+    """`(signed, problems)`: the parsed `signed.json` (None when absent) and what is wrong with it."""
+    path = root / SIGNED_JSON
+    if not path.is_file():
+        return None, []
+    try:
+        signed = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as err:
+        return None, [f"{SIGNED_JSON} is not valid JSON: {err}"]
+    if not isinstance(signed, dict) or not isinstance(signed.get("files"), dict):
+        return None, [f"{SIGNED_JSON} is malformed"]
+    if signed.get("sha") != candidate_sha:
+        return None, [
+            f"{SIGNED_JSON} sha {str(signed.get('sha'))[:7]} differs from {CANDIDATE_JSON} "
+            f"{candidate_sha[:7]}"
+        ]
+    return signed, []
+
+
 def verify_candidate(directory, draft):
-    """Every way the downloaded files disagree with the manifest and the draft, as messages."""
+    """Every way the downloaded files disagree with the manifests and the draft, as messages.
+
+    With a `signed.json` an earlier release attempt got as far as uploading signed
+    files, so a listed file may carry either hash; any other file must be one that
+    attempt uploaded, in the state it uploaded it.
+    """
     root = Path(directory)
     problems = []
-    present = {e.name for e in root.iterdir() if e.name != "candidate.json"}
-    path = root / "candidate.json"
+    present = {e.name for e in root.iterdir() if e.name not in (CANDIDATE_JSON, SIGNED_JSON)}
+    path = root / CANDIDATE_JSON
     if not path.is_file():
-        return ["candidate.json is missing"] + [f"unlisted file: {n}" for n in sorted(present)], None
+        return [f"{CANDIDATE_JSON} is missing"] + [f"unlisted file: {n}" for n in sorted(present)], None
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
     except ValueError as err:
-        return [f"candidate.json is not valid JSON: {err}"], None
+        return [f"{CANDIDATE_JSON} is not valid JSON: {err}"], None
     bad = manifest_problems(manifest)
     if bad:
-        return [f"candidate.json: {b}" for b in bad], None
+        return [f"{CANDIDATE_JSON}: {b}" for b in bad], None
 
+    signed, signed_problems = read_signed(root, manifest["sha"])
+    problems += signed_problems
+    signed_files = signed["files"] if signed else {}
     listed = manifest["files"]
     for name in sorted(listed):
         file = root / name
         if not file.is_file():
             problems.append(f"missing file: {name}")
-        elif sha256(file) != listed[name]:
+        elif sha256(file) != listed[name] and sha256(file) != signed_files.get(name):
             problems.append(f"hash differs: {name}")
-    problems += [f"unlisted file: {n}" for n in sorted(present - set(listed))]
+    for name in sorted(present - set(listed)):
+        file = root / name
+        if name not in signed_files:
+            problems.append(f"unlisted file: {name}")
+        elif sha256(file) != signed_files[name]:
+            problems.append(f"hash differs: {name}")
     if manifest["sha"] != draft.get("target_commitish"):
         problems.append(
-            f"candidate.json sha {manifest['sha'][:7]} differs from the draft's "
+            f"{CANDIDATE_JSON} sha {manifest['sha'][:7]} differs from the draft's "
             f"{str(draft.get('target_commitish'))[:7]}"
         )
     if draft.get("tag_name") != f"v{manifest['version']}":
         problems.append(
-            f"candidate.json version {manifest['version']} differs from the draft's tag "
+            f"{CANDIDATE_JSON} version {manifest['version']} differs from the draft's tag "
             f"{draft.get('tag_name')}"
         )
     return problems, manifest
@@ -401,23 +445,50 @@ def resume_published():
 
 
 def cmd_fetch(args):
-    """Download the candidate into `--dir` and check every hash.
+    """Check the candidate out as a source tree with its files in `<tree>/dist`.
+
+    Downloads into a scratch directory and verifies there, so a failed check leaves
+    nothing behind; the worktree is added only once everything has passed. The
+    project's own `publish` task then runs from that tree, so the signing task
+    always matches the files it signs.
 
     Always sets the output `published`: `true` only on the resume path.
     """
     draft = standing_draft()
     if draft is None:
         return resume_published()
-    out = Path(args.dir)
-    if out.exists() and (not out.is_dir() or any(out.iterdir())):
-        raise CandidateError(f"{out} is not empty; fetch needs an empty directory")
-    out.mkdir(parents=True, exist_ok=True)
-    ghapi.gh("release", "download", draft["tag_name"], "--dir", str(out))
-    problems, manifest = verify_candidate(out, draft)
-    if problems:
-        for problem in problems:
-            print(f"fetch: {problem}", file=sys.stderr)
-        raise CandidateError(f"the candidate failed {len(problems)} check(s)")
+    tree = Path(args.tree)
+    scratch = Path(tempfile.mkdtemp(prefix="candidate-"))
+    try:
+        ghapi.gh("release", "download", draft["tag_name"], "--dir", str(scratch))
+        problems, manifest = verify_candidate(scratch, draft)
+        if problems:
+            for problem in problems:
+                print(f"fetch: {problem}", file=sys.stderr)
+            raise CandidateError(f"the candidate failed {len(problems)} check(s)")
+        sha = manifest["sha"]
+        # The candidate must be a commit of main: a draft can only be as trustworthy as
+        # the history it claims. The yes/no answer is the exit code of merge-base.
+        git("fetch", "origin", "main")
+        if not git_ok("merge-base", "--is-ancestor", sha, "origin/main"):
+            raise CandidateError(f"the candidate {sha[:7]} is not on main")
+        if tree.exists():
+            raise CandidateError(f"{tree} already exists; remove it and run fetch again")
+        git("worktree", "add", "--detach", str(tree), sha)
+        dist = tree / "dist"
+        if dist.exists() and any(dist.iterdir()):
+            git("worktree", "remove", "--force", str(tree))
+            raise CandidateError(
+                f"{dist} is tracked and not empty: a project that commits a dist/ folder "
+                "cannot use this release layout"
+            )
+        dist.mkdir(parents=True, exist_ok=True)
+        for entry in sorted(scratch.iterdir()):
+            # signed.json described an earlier attempt; the next publish writes a fresh one.
+            if entry.name != SIGNED_JSON:
+                shutil.move(str(entry), str(dist / entry.name))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
     ghapi.output("published", "false")
     ghapi.output("sha", manifest["sha"])
     ghapi.output("version", manifest["version"])
@@ -450,10 +521,18 @@ def cmd_publish(args):
 
     names = ", ".join(f.name for f in files)
     if args.dry_run:
-        print(f"dry run: would upload {len(files)} files to {tag}: {names}")
+        print(f"dry run: would upload {SIGNED_JSON}, then {len(files)} files to {tag}: {names}")
         print("dry run: would run switches.py shipped")
         print(f"dry run: would publish {tag} (creates the tag at {sha[:7]})")
+        print(f"dry run: would delete {CANDIDATE_JSON} and {SIGNED_JSON} from the release")
         return 0
+    # signed.json goes up before any file is replaced: if this run dies half-way, the
+    # draft then holds files in two states, and `fetch` can only tell which are
+    # legitimate (signed) from the hashes this manifest recorded.
+    signed_path = Path(args.dir) / SIGNED_JSON
+    signed = {"sha": sha, "files": {f.name: sha256(f) for f in files}}
+    signed_path.write_text(json.dumps(signed, indent=2) + "\n", encoding="utf-8")
+    ghapi.gh("release", "upload", draft["tag_name"], str(signed_path), "--clobber")
     ghapi.gh("release", "upload", draft["tag_name"], *[str(f) for f in files], "--clobber")
     switches("shipped")
     ghapi.api(
@@ -461,8 +540,22 @@ def cmd_publish(args):
         "PATCH",
         {"draft": False, "body": strip_candidate_lines(draft.get("body"))},
     )
+    drop_manifests(draft["id"], tag)
     print(f"published: {tag} {sha[:7]} ({len(files)} files)")
     return 0
+
+
+def drop_manifests(release_id, tag):
+    """Delete the manifests from the published release: they describe the candidate, not the release.
+
+    The release is out by now, so a failure here warns and never fails the step.
+    """
+    try:
+        for asset in draft_assets(release_id):
+            if asset["name"] in (CANDIDATE_JSON, SIGNED_JSON):
+                ghapi.api(f"releases/assets/{asset['id']}", "DELETE")
+    except RuntimeError as err:
+        print(f"::warning title=Manifests left on {tag}::could not delete {CANDIDATE_JSON} and {SIGNED_JSON}: {err}")
 
 
 def next_patch(version):
@@ -478,6 +571,13 @@ def cmd_bump(args):
     """Move `main` to the version after the one just released."""
     released = args.released.removeprefix("v")
     nxt = next_patch(released)
+    if not args.dry_run and os.environ.get("BUMP_KEY_SET") != "true":
+        # A push with the workflow's own token starts no workflow; the deploy key's
+        # push does, and that is what builds the next candidate.
+        raise CandidateError(
+            "BUMP_KEY is not set: the bump is pushed with a deploy key so that it starts main "
+            '(README, "Copy it into a project")'
+        )
     if args.dry_run:
         # Read the tree as it is: a dry run must not touch the checkout.
         carried = mise_version()
@@ -504,15 +604,6 @@ def cmd_bump(args):
             print(f"push rejected (attempt {attempt}); main moved, trying again")
             continue
         print(f"bumped main to {nxt}")
-        # A push made with the workflow's token starts no workflows, so start the
-        # next candidate's build by hand. The bump has landed either way: if the
-        # dispatch fails, the next merge builds the candidate, so warn, don't fail.
-        try:
-            ghapi.api("actions/workflows/main.yml/dispatches", "POST", {"ref": "main"})
-        except RuntimeError as err:
-            print(f"::warning title=main not started::the next merge builds v{nxt}: {err}")
-        else:
-            print(f"started main for v{nxt}")
         return 0
     return 1  # unreachable: the loop returns or raises
 
@@ -522,16 +613,16 @@ def parser():
     top = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = top.add_subparsers(dest="command", required=True)
     sub.add_parser("base", help="print the last commit main tested green").set_defaults(run=cmd_base)
-    for name, func, text in (
-        ("record", cmd_record, "put the build on the standing draft"),
-        ("fetch", cmd_fetch, "download the candidate and check it"),
-        ("publish", cmd_publish, "upload signed files and publish the draft"),
-    ):
-        one = sub.add_parser(name, help=text)
-        one.add_argument("--dir", default="dist")
-        if name == "publish":
-            one.add_argument("--dry-run", action="store_true")
-        one.set_defaults(run=func)
+    record = sub.add_parser("record", help="put the build on the standing draft")
+    record.add_argument("--dir", default="dist")
+    record.set_defaults(run=cmd_record)
+    fetch = sub.add_parser("fetch", help="check the candidate out as a source tree with its files")
+    fetch.add_argument("--tree", default="candidate", help="where the source tree goes (must not exist)")
+    fetch.set_defaults(run=cmd_fetch)
+    publish = sub.add_parser("publish", help="upload signed files and publish the draft")
+    publish.add_argument("--dir", default="candidate/dist")
+    publish.add_argument("--dry-run", action="store_true")
+    publish.set_defaults(run=cmd_publish)
     bump = sub.add_parser("bump", help="move main to the next version")
     bump.add_argument("--released", required=True, help="the version just released")
     bump.add_argument("--dry-run", action="store_true")
