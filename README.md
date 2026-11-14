@@ -35,7 +35,10 @@ Every step in every workflow is `mise run <task>`. The workflows hold no shell; 
 3. Write the project's tasks (the table below) in `mise.toml`.
 4. Edit the blocks marked `# PROJECT` in the workflows: the job list and OS matrix in `check.yml`, the build targets in `main.yml`, the commit identity in `release.yml`. Every job you add to `check.yml` goes in the gate's `needs:`.
 5. Edit `.github/ci/paths.yml`: one key per path-gated job id, with the paths that should trigger it. A job with no key always runs.
-6. On GitHub: require the status `gate` on `main` (a ruleset or branch protection; do not require branches to be up to date), and create an Environment named `release`, limited to `main`, holding the signing keys and deploy tokens. On a public repository, make yourself its required reviewer.
+6. On GitHub:
+   - require the status `gate` on `main` (a ruleset or branch protection; do not require branches to be up to date);
+   - create an Environment named `release`, limited to `main`, holding the signing keys and deploy tokens. On a public repository, make yourself its required reviewer;
+   - add a deploy key with write access and put its private half in the secret `BUMP_KEY` of that Environment. The release pushes its one-line "Start v\<next>" commit with it. If `main` has a ruleset, give deploy keys its only bypass. (The workflow's own token can't do this job: its pushes start no workflow runs, and on a personal account it can't be given a bypass.)
 7. Run `mise run ci:lint` and `mise run check`, open a pull request, and watch `gate`.
 
 `docs/context/contract.md` is the precise version of everything below.

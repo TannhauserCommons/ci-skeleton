@@ -28,7 +28,6 @@ jobs:
     permissions:
       contents: write
       issues: write
-      actions: write
     # Shared with main's candidate job: see main.yml.
     concurrency:
       group: candidate
@@ -37,25 +36,28 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
     steps:
+      # The release scripts run from main. The deploy key makes the bump push
+      # count as a real push: it may pass a ruleset on main, and it starts the
+      # next main run, which a push by the workflow token would not.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          ssh-key: ${{ secrets.BUMP_KEY }}
       - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
           version: 2026.10.23
+          cache_save: false
+      # Puts the candidate's commit in candidate/ and its files in
+      # candidate/dist, every hash checked.
       - id: candidate
         name: mise run ci:fetch
         run: mise run ci:fetch
-      # The candidate's own tree signs and publishes its files.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ steps.candidate.outputs.sha }}
-          fetch-depth: 0
-          clean: false
       # `published` is true only on a rerun of a release that published and
       # then failed: the bump is all that is left.
+      # The candidate's own tree signs its files, so the task matches them.
       - name: mise run publish
         if: ${{ steps.candidate.outputs.published != 'true' }}
+        working-directory: candidate
         run: mise run publish
       - name: mise run ci:publish
         if: ${{ steps.candidate.outputs.published != 'true' }}
@@ -64,6 +66,7 @@ jobs:
         run: mise run ci:bump --released ${{ steps.candidate.outputs.version }} ${{ inputs.dry_run && '--dry-run' || '' }}
         # PROJECT: who the "Start v<next>" commit is by.
         env:
+          BUMP_KEY_SET: ${{ secrets.BUMP_KEY != '' }}
           GIT_AUTHOR_NAME: github-actions[bot]
           GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
           GIT_COMMITTER_NAME: github-actions[bot]
