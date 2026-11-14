@@ -20,6 +20,11 @@ MISE_RUN = re.compile(r"^mise run (\S+)")
 EXPRESSION = re.compile(r"\$\{\{.*?\}\}")
 EXPRESSION_BODY = re.compile(r"\$\{\{(.*?)\}\}")
 PULL_REQUEST_TARGET = re.compile(r"\bpull_request_target\b")
+CACHE_SAVE_OK = ("false", "${{ github.ref == 'refs/heads/main' }}")
+CACHE_SAVE_MESSAGE = (
+    "jdx/mise-action must set cache_save to false or to ${{ github.ref == 'refs/heads/main' }}"
+    " (only main saves caches)"
+)
 STRING = re.compile(r"'(?:[^']|'')*'")
 CALL = re.compile(r"([A-Za-z_]\w*)\s*\(")
 OPERATORS = re.compile(r"&&|\|\||!=|==|[!()]")
@@ -140,17 +145,43 @@ def untrusted(expression):
     return [t for t in tokens if t not in LITERALS and not any(p.fullmatch(t) for p in TRUSTED)]
 
 
-def sets_cache_save(sub, keys, key_indent):
-    """Whether the step's `with:` holds a `cache_save` key (block or inline form)."""
+def inline_value(flow, key):
+    """The value of `key` in a one-line `{a: 1, b: 2}` mapping, unquoted, or None."""
+    match = re.search(rf"[{{,]\s*[\"']?{key}[\"']?\s*:\s*", flow)
+    if not match:
+        return None
+    rest, i, quote = flow[match.end() :], 0, None
+    while i < len(rest):
+        if quote:
+            quote = None if rest[i] == quote else quote
+        elif rest.startswith("${{", i):
+            # An expression holds `}` and quotes of its own; skip to its end.
+            i = rest.find("}}", i) + 1 if "}}" in rest[i:] else len(rest)
+        elif rest[i] in "\"'":
+            quote = rest[i]
+        elif rest[i] in ",}":
+            break
+        i += 1
+    return unquote(rest[:i])
+
+
+def cache_save_value(sub, keys, key_indent):
+    """The `cache_save` value in the step's own `with:` mapping, or None.
+
+    Only the lines that belong to `with:` count: those indented deeper than the
+    `with:` key, up to the next key at its indent or shallower (a sibling `env:`
+    may hold a `cache_save` of its own).
+    """
     if "with" not in keys:
-        return False
+        return None
     at, value = keys["with"]
     if value:
-        return re.search(r"\bcache_save\s*:", value) is not None
-    first = next((i for i in range(at + 1, len(sub)) if content_of(sub[i])), None)
-    if first is None or indent_of(sub[first]) <= key_indent:
-        return False
-    return "cache_save" in read_keys(sub, at + 1, len(sub), indent_of(sub[first]), ())
+        return inline_value(value, "cache_save")
+    end = next((i for i in range(at + 1, len(sub)) if content_of(sub[i]) and indent_of(sub[i]) <= key_indent), len(sub))
+    first = next((i for i in range(at + 1, end) if content_of(sub[i])), None)
+    if first is None:
+        return None
+    return read_keys(sub, at + 1, end, indent_of(sub[first]), ()).get("cache_save", (0, None))[1]
 
 
 def check_step(sub, key_indent):
@@ -162,8 +193,9 @@ def check_step(sub, key_indent):
         if message:
             found.append((keys["uses"][0], message))
         # Only main may save caches and the action's default is to save.
-        if keys["uses"][1].lower().split("@")[0] == "jdx/mise-action" and not sets_cache_save(sub, keys, key_indent):
-            found.append((keys["uses"][0], "jdx/mise-action must set cache_save (only main saves caches)"))
+        is_mise = keys["uses"][1].lower().split("@")[0] == "jdx/mise-action"
+        if is_mise and cache_save_value(sub, keys, key_indent) not in CACHE_SAVE_OK:
+            found.append((keys["uses"][0], CACHE_SAVE_MESSAGE))
     if "run" in keys:
         at, value = keys["run"]
         # Expressions are filled in before the shell sees the line, so one that

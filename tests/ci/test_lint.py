@@ -301,10 +301,17 @@ class PermissionsTest(unittest.TestCase):
 
 
 class MiseActionTest(unittest.TestCase):
-    MESSAGE = "jdx/mise-action must set cache_save (only main saves caches)"
+    MESSAGE = (
+        "jdx/mise-action must set cache_save to false or to ${{ github.ref == 'refs/heads/main' }}"
+        " (only main saves caches)"
+    )
+    MAIN = "${{ github.ref == 'refs/heads/main' }}"
 
     def steps(self, body, ref=f"jdx/mise-action@{SHA}"):
         return workflow(job(f"      - uses: {ref}\n{body}"))
+
+    def with_value(self, value):
+        return self.steps(f"        with:\n          version: 1\n          cache_save: {value}\n")
 
     def test_no_with_is_a_finding_on_the_uses_line(self):
         self.assertEqual(findings(self.steps("")), [(12, self.MESSAGE)])
@@ -313,15 +320,70 @@ class MiseActionTest(unittest.TestCase):
         text = self.steps("        with:\n          version: 2026.10.23\n")
         self.assertEqual(findings(text), [(12, self.MESSAGE)])
 
-    def test_cache_save_false_or_expression_is_fine(self):
-        for value in ("false", "${{ github.ref == 'refs/heads/main' }}", "'false'"):
+    def test_false_and_the_main_expression_pass_quoted_or_not(self):
+        for value in ("false", "'false'", '"false"', f"{self.MAIN}", f'"{self.MAIN}"', f"'{self.MAIN}'", "false # why"):
             with self.subTest(value=value):
-                text = self.steps(f"        with:\n          version: 1\n          cache_save: {value}\n")
-                self.assertEqual(findings(text), [])
+                self.assertEqual(findings(self.with_value(value)), [])
 
-    def test_cache_save_first_or_inline_is_fine(self):
+    def test_any_other_value_is_a_finding(self):
+        for value in (
+            "true",
+            "'true'",
+            "${{ github.ref == 'refs/heads/dev' }}",
+            "${{ github.event_name == 'push' }}",
+            "${{ github.ref != 'refs/heads/main' }}",
+            "${{ true }}",
+            "False",
+            "",
+            "0",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(findings(self.with_value(value)), [(12, self.MESSAGE)])
+
+    def test_cache_save_first_in_with_passes(self):
         self.assertEqual(findings(self.steps("        with:\n          cache_save: false\n")), [])
-        self.assertEqual(findings(self.steps("        with: {cache_save: false, version: 1}\n")), [])
+
+    def test_inline_with(self):
+        for flow in (
+            "{cache_save: false}",
+            "{version: x, cache_save: false}",
+            "{ cache_save: false, version: x }",
+            f"{{version: x, cache_save: {self.MAIN}}}",
+            f"{{cache_save: {self.MAIN}, version: x}}",
+            "{version: x, 'cache_save': 'false'}",
+        ):
+            with self.subTest(flow=flow):
+                self.assertEqual(findings(self.steps(f"        with: {flow}\n")), [])
+        for flow in ("{version: x, cache_save: true}", "{version: x}", "{}", "{cache_save: ${{ github.ref }}}"):
+            with self.subTest(flow=flow):
+                self.assertEqual(findings(self.steps(f"        with: {flow}\n")), [(12, self.MESSAGE)])
+
+    def test_cache_save_in_a_sibling_env_block_does_not_count(self):
+        text = self.steps("        with:\n          version: 1\n        env:\n          cache_save: false\n")
+        self.assertEqual(findings(text), [(12, self.MESSAGE)])
+
+    def test_sibling_env_at_the_same_indent_as_with_children_does_not_count(self):
+        # The reviewer's case: env: nested so its child sits where with's children sit.
+        text = self.steps("        with:\n          version: 1\n          env:\n            x: 1\n        env:\n          cache_save: false\n")
+        self.assertEqual(findings(text), [(12, self.MESSAGE)])
+
+    def test_env_before_with_does_not_leak_into_it(self):
+        text = self.steps("        env:\n          cache_save: false\n        with:\n          version: 1\n")
+        self.assertEqual(findings(text), [(12, self.MESSAGE)])
+
+    def test_with_after_env_still_reads_its_own_cache_save(self):
+        text = self.steps("        env:\n          cache_save: true\n        with:\n          cache_save: false\n")
+        self.assertEqual(findings(text), [])
+
+    def test_with_before_and_after_uses(self):
+        for body in (
+            f"      - with:\n          cache_save: false\n        uses: jdx/mise-action@{SHA}\n",
+            f"      - uses: jdx/mise-action@{SHA}\n        with:\n          cache_save: false\n",
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(findings(workflow(job(body))), [])
+        bad = workflow(job(f"      - with:\n          cache_save: true\n        uses: jdx/mise-action@{SHA}\n"))
+        self.assertEqual(findings(bad), [(14, self.MESSAGE)])
 
     def test_cache_save_on_the_next_step_does_not_count(self):
         text = self.steps("        with:\n          version: 1\n") + (
@@ -329,21 +391,14 @@ class MiseActionTest(unittest.TestCase):
         )
         self.assertEqual(findings(text), [(12, self.MESSAGE)])
 
-    def test_cache_save_outside_with_does_not_count(self):
-        text = self.steps("        env:\n          cache_save: false\n")
-        self.assertEqual(findings(text), [(12, self.MESSAGE)])
-
-    def test_with_on_the_dash_line_order(self):
-        text = workflow(job(f"      - with:\n          cache_save: false\n        uses: jdx/mise-action@{SHA}\n"))
-        self.assertEqual(findings(text), [])
-
     def test_other_actions_need_no_cache_save(self):
         text = workflow(job(f"      - uses: actions/cache@{SHA}\n"))
         self.assertEqual(findings(text), [])
 
     def test_unpinned_mise_action_gets_both_findings(self):
-        text = self.steps("", ref="jdx/mise-action@v3")
-        self.assertEqual(len(findings(text)), 2)
+        text = self.steps("        with:\n          cache_save: false\n", ref="jdx/mise-action@v3")
+        self.assertEqual(len(findings(text)), 1)
+        self.assertEqual(len(findings(self.steps("", ref="jdx/mise-action@v3"))), 2)
 
 
 class RunExpressionTest(unittest.TestCase):
