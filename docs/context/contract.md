@@ -103,7 +103,7 @@ expires = "0.3.0"         # a release (x.y.z) or a date (YYYY-MM-DD)
 
 `python .github/ci/after.py <run_id>`. Reads the run and its jobs through the API.
 
-1. Conclusion `cancelled` or `skipped`: do nothing (cancelled is neither red nor green).
+1. Conclusion `skipped`, or `cancelled` on anything but a `main` run that had started a job: do nothing (cancelled is neither red nor green). GitHub also concludes a run `cancelled` when a job hits its timeout; a `main` run stopped after it started is handled as a failure in step 4, with no rerun.
 2. Conclusion `failure` and `run_attempt == 1`: if **every** failed job is an infra failure, rerun the failed jobs once and stop. A failed job is infra when its first failed step comes before the job's first step named `mise run ...`, or when no step is recorded as failed (a lost runner). The `gate` job is left out: it fails because another job did. Never by log text.
 3. Flakes (any conclusion): download the run's `flakes-*` artifacts, and for each flaky test open or comment on one issue titled `flaky: <test id>` (label `flaky`). At most 10 new issues per run.
 4. Workflow `main` only, and only when no later `main` run has finished since: on failure open or update the one issue labelled `main-red`, naming the commit range since the last green `main` run, its commits and authors, the failed jobs and the run link; the rule is fix or revert, revert by default. On success close it with a comment.

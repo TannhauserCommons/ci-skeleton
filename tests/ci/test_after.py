@@ -140,12 +140,43 @@ class AfterTestCase(unittest.TestCase):
 
 
 class SkipTests(AfterTestCase):
-    def test_cancelled_run_does_nothing(self):
-        fake = FakeGitHub(make_run("cancelled"), jobs=[real_failure()])
+    def test_cancelled_pr_run_does_nothing(self):
+        fake = FakeGitHub(make_run("cancelled", path=".github/workflows/check.yml",
+                                   event="pull_request"), jobs=[real_failure()])
         code, out, _ = self.run_after(fake)
         self.assertEqual(code, 0)
         self.assertEqual(fake.writes, [])
         self.assertEqual(fake.requested, [("GET", f"actions/runs/{RUN_ID}")])
+
+    def test_cancelled_main_run_with_a_failed_job_is_red(self):
+        fake = FakeGitHub(make_run("cancelled"), jobs=[real_failure()])
+        self.run_after(fake)
+        self.assertEqual(len(fake.opened()), 1)
+
+    def test_main_run_whose_job_timed_out_is_red_and_not_rerun(self):
+        hung = job("build (linux)", [step(1, "Set up job"), step(2, "mise run build", "cancelled")],
+                   conclusion="cancelled")
+        fake = FakeGitHub(make_run("cancelled"), jobs=[hung, job("candidate", [], "skipped")])
+        code, out, _ = self.run_after(fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(fake.posts("rerun-failed-jobs"), [])
+        opened = fake.opened()
+        self.assertEqual(len(opened), 1)
+        self.assertIn("build (linux) (timed out or cancelled)", opened[0]["body"])
+
+    def test_main_run_replaced_before_it_started_does_nothing(self):
+        waiting = job("build (linux)", [], conclusion="cancelled")
+        fake = FakeGitHub(make_run("cancelled"), jobs=[waiting])
+        self.run_after(fake)
+        self.assertEqual(fake.writes, [])
+
+    def test_cancelled_check_run_does_nothing_even_with_a_stopped_job(self):
+        hung = job("test", [step(1, "Set up job"), step(2, "mise run check", "cancelled")],
+                   conclusion="cancelled")
+        fake = FakeGitHub(make_run("cancelled", path=".github/workflows/check.yml",
+                                   event="pull_request"), jobs=[hung])
+        self.run_after(fake)
+        self.assertEqual(fake.writes, [])
 
     def test_skipped_run_does_nothing(self):
         fake = FakeGitHub(make_run("skipped"))
