@@ -25,7 +25,7 @@ def entries(version, switches):
     for path in sorted((ROOT / "fixture" / "hello").glob("*.py")):
         files[f"hello/{path.name}"] = path.read_bytes().replace(b"\r\n", b"\n")
     flags = ", ".join(f'"{k}": {v}' for k, v in sorted(switches.items()))
-    build = f'VERSION = "{version}-oops"\nSWITCHES = {{{flags}}}\n'
+    build = f'VERSION = "{version}"\nSWITCHES = {{{flags}}}\n'
     files["hello/_build.py"] = build.encode("utf-8")
     return files
 
