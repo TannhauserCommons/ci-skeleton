@@ -13,7 +13,9 @@ permissions:
 
 jobs:
   after:
-    if: ${{ github.event.workflow_run.conclusion != 'cancelled' && github.event.workflow_run.conclusion != 'skipped' }}
+    # A cancelled PR run needs nothing. A cancelled main run may be a job that
+    # hit its timeout, which GitHub also concludes "cancelled".
+    if: ${{ github.event.workflow_run.conclusion != 'skipped' && (github.event.workflow_run.conclusion != 'cancelled' || github.event.workflow_run.path == '.github/workflows/main.yml') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

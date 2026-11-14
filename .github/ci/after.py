@@ -82,6 +82,19 @@ def failed_jobs(jobs):
     return [job for job in jobs if job.get("conclusion") == "failure"]
 
 
+def stopped_jobs(jobs):
+    """Jobs that were cancelled after they had started: timed out, or stopped by hand.
+
+    A run that was replaced while it waited never started a job, so it has none.
+    """
+    return [
+        {**job, "name": f"{job.get('name')} (timed out or cancelled)"}
+        for job in jobs
+        if job.get("conclusion") == "cancelled"
+        and any(step.get("conclusion") == "success" for step in job.get("steps") or [])
+    ]
+
+
 def is_gate(job):
     """The gate fails because another job did; it says nothing about the cause."""
     name = job.get("name") or ""
@@ -359,12 +372,23 @@ def handle(run_id):
     """The four steps of the contract, in order."""
     run = ghapi.api(f"actions/runs/{run_id}")
     conclusion = run.get("conclusion")
-    if conclusion in ("cancelled", "skipped", None):
+    if conclusion in ("skipped", None):
         print(f"after: run {run_id} is {conclusion or 'not finished'}; nothing to do")
         return 0
 
     failed = []
-    if conclusion == "failure":
+    if conclusion == "cancelled":
+        # GitHub concludes a run "cancelled" when a job hit its timeout, the
+        # same as when someone cancelled it. On a PR the gate's own failed
+        # check blocks the merge. On main nothing else would say that a build
+        # hung, so a main run that was stopped after it had started is red.
+        jobs = get_jobs(run) if is_main_run(run) else []
+        failed = failed_jobs(jobs) + stopped_jobs(jobs)
+        if not failed:
+            print(f"after: run {run_id} is cancelled; nothing to do")
+            return 0
+        conclusion = "failure"
+    elif conclusion == "failure":
         failed = failed_jobs(get_jobs(run))
         if rerun_if_infra(run, failed):
             return 0
