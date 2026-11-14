@@ -117,8 +117,9 @@ class Base(unittest.TestCase):
         env = mock.patch.dict(os.environ, {}, clear=False)
         env.start()
         self.addCleanup(env.stop)
-        for key in ("GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_OUTPUT", "BUMP_KEY_SET"):
+        for key in ("GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_OUTPUT"):
             os.environ.pop(key, None)
+        os.environ["BUMP_KEY_SET"] = "true"  # the workflow sets it for the whole release job
         self.is_ancestor = True
         self.tree = Path(self.tmp.name) / "candidate"
         self.tracked_dist = False  # a worktree that already holds a non-empty dist/
@@ -488,7 +489,8 @@ class FetchTest(Base):
         self.assertEqual(code, 0, err)
         self.assertIn(("worktree", "add", "--detach", str(self.tree), SHA), self.git_calls)
         self.assertEqual(
-            sorted(p.name for p in self.dir.iterdir()), ["a.zip", "b.zip", "candidate.json"]
+            sorted(p.name for p in self.dir.iterdir()),
+            ["a.zip", "b.zip", "candidate.json", "signed.json"],
         )
         self.assertEqual((self.dir / "a.zip").read_bytes(), b"aaa")
         self.assertTrue(all(not d.exists() for d in self.scratch_dirs))
@@ -564,7 +566,7 @@ class FetchTest(Base):
         downloads = self.files(**signed, **{"signed.json": self.signed(signed)})
         code, _, err = self.fetch(downloads)
         self.assertEqual(code, 0, err)
-        self.assertFalse((self.dir / "signed.json").exists())
+        self.assertTrue((self.dir / "signed.json").exists())
 
     def test_partly_signed_with_a_signed_file_missing_from_the_draft(self):
         # a.zip got replaced, b.zip not yet; the signature file never made it up.
@@ -572,9 +574,49 @@ class FetchTest(Base):
         downloads = self.files(**{"a.zip": b"A-signed", "signed.json": self.signed(signed)})
         code, _, err = self.fetch(downloads)
         self.assertEqual(code, 0, err)
-        self.assertFalse((self.dir / "signed.json").exists())
+        self.assertTrue((self.dir / "signed.json").exists())
         self.assertEqual((self.dir / "a.zip").read_bytes(), b"A-signed")
         self.assertEqual((self.dir / "b.zip").read_bytes(), b"bbb")
+
+    def signed_lists(self, files, sha_=SHA):
+        """A signed.json in the list shape: `files` maps a name to the contents of every attempt."""
+        return json.dumps(
+            {"sha": sha_, "files": {n: [sha(d) for d in datas] for n, datas in files.items()}}
+        ).encode()
+
+    def test_hash_from_any_attempt_in_the_list_passes(self):
+        lists = {"a.zip": [b"A-try1", b"A-try2"], "b.zip": [b"B-try1"], "x.sha256": [b"s1", b"s2"]}
+        downloads = self.files(
+            **{"a.zip": b"A-try1", "x.sha256": b"s2", "signed.json": self.signed_lists(lists)}
+        )
+        code, _, err = self.fetch(downloads)
+        self.assertEqual(code, 0, err)
+        self.assertEqual((self.dir / "signed.json").read_bytes(), downloads["signed.json"])
+
+    def test_hash_in_neither_list_nor_candidate_fails(self):
+        lists = {"a.zip": [b"A-try1", b"A-try2"]}
+        downloads = self.files(**{"a.zip": b"A-try3", "signed.json": self.signed_lists(lists)})
+        code, _, err = self.fetch(downloads)
+        self.assertEqual(code, 1)
+        self.assertIn("hash differs: a.zip", err)
+
+    def test_extra_file_must_match_a_hash_in_its_list(self):
+        lists = {"x.sha256": [b"s1", b"s2"]}
+        downloads = self.files(**{"x.sha256": b"s3", "signed.json": self.signed_lists(lists)})
+        code, _, err = self.fetch(downloads)
+        self.assertEqual(code, 1)
+        self.assertIn("hash differs: x.sha256", err)
+
+    def test_malformed_hash_list_fails(self):
+        bad = json.dumps({"sha": SHA, "files": {"a.zip": [1, 2]}}).encode()
+        code, _, err = self.fetch(self.files(**{"signed.json": bad}))
+        self.assertEqual(code, 1)
+        self.assertIn("signed.json is malformed", err)
+
+    def test_old_string_shape_still_passes(self):
+        downloads = self.files(**{"a.zip": b"A-signed", "signed.json": self.signed({"a.zip": b"A-signed"})})
+        code, _, err = self.fetch(downloads)
+        self.assertEqual(code, 0, err)
 
     def test_file_matching_neither_hash_fails(self):
         signed = {"a.zip": b"A-signed"}
@@ -616,6 +658,42 @@ class FetchTest(Base):
         self.assertIn(("merge-base", "--is-ancestor", SHA, "origin/main"), self.git_calls)
 
 
+class BumpKeyGateTest(Base):
+    """A missing deploy key stops the release at fetch, before any GitHub call."""
+
+    def test_fetch_refuses_without_the_key_on_both_paths(self):
+        for releases, tags in (([draft()], []), ([draft("v0.2.0", draft_=False)], ["v0.2.0"])):
+            with self.subTest(releases=len(releases), draft=releases[0]["draft"]):
+                fake = FakeGitHub(releases=releases, tags=tags)
+                self.install(fake)
+                api = mock.Mock(side_effect=AssertionError("GitHub was called"))
+                for name in ("api", "gh"):
+                    patcher = mock.patch.object(ghapi, name, api)
+                    patcher.start()
+                    self.addCleanup(patcher.stop)
+                for value in (None, "false"):
+                    os.environ.pop("BUMP_KEY_SET", None)
+                    if value:
+                        os.environ["BUMP_KEY_SET"] = value
+                    code, _, err = run(None, ["fetch", "--tree", str(self.tree)])
+                    self.assertEqual(code, 1)
+                    self.assertIn("BUMP_KEY is not set", err)
+                    self.assertFalse(self.tree.exists())
+                api.assert_not_called()
+                mock.patch.stopall()
+
+    def test_dry_runs_do_not_need_the_key(self):
+        os.environ.pop("BUMP_KEY_SET")
+        self.write("a.zip")
+        self.write(
+            "candidate.json", json.dumps({"sha": SHA, "version": "0.2.0", "files": {}}).encode()
+        )
+        fake = FakeGitHub(releases=[draft()])
+        self.install(fake, version="0.2.0")
+        self.assertEqual(run(None, ["publish", "--dir", str(self.dir), "--dry-run"])[0], 0)
+        self.assertEqual(run(None, ["bump", "--released", "0.2.0", "--dry-run"])[0], 0)
+
+
 class FetchResumeTest(Base):
     """No draft: a release that published but did not finish is resumed, not refetched."""
 
@@ -641,6 +719,38 @@ class FetchResumeTest(Base):
             gh_out.read_text().splitlines(),
             ["published=true", f"sha={SHA}", "version=0.2.0", "tag=v0.2.0"],
         )
+
+    def test_resume_removes_leftover_manifest_assets(self):
+        fake = FakeGitHub(
+            releases=[self.published()],
+            tags=["v0.2.0"],
+            assets=[
+                {"id": 1, "name": "candidate.json"},
+                {"id": 2, "name": "a.zip"},
+                {"id": 3, "name": "signed.json"},
+            ],
+        )
+        (code, _, _), _ = self.resume(fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            sorted(e[1] for e in fake.events if e[0] == "delete"),
+            ["candidate.json", "signed.json"],
+        )
+
+    def test_resume_cleanup_failure_only_warns(self):
+        class Stubborn(FakeGitHub):
+            def api(self, path, method="GET", body=None, paginate=False):
+                if method == "DELETE":
+                    raise RuntimeError("HTTP 500")
+                return super().api(path, method, body, paginate)
+
+        fake = Stubborn(
+            releases=[self.published()], tags=["v0.2.0"], assets=[{"id": 1, "name": "candidate.json"}]
+        )
+        (code, out, _), gh_out = self.resume(fake)
+        self.assertEqual(code, 0)
+        self.assertIn("::warning", out)
+        self.assertIn("published=true", gh_out.read_text())
 
     def test_annotated_tag_resolves_to_its_commit(self):
         fake = FakeGitHub(
@@ -732,7 +842,54 @@ class PublishTest(Base):
         self.install(fake)
         run(None, ["publish", "--dir", str(self.dir)])
         signed = json.loads((self.dir / "signed.json").read_text())
-        self.assertEqual(signed, {"sha": SHA, "files": {"a.zip": sha(b"signed")}})
+        self.assertEqual(signed, {"sha": SHA, "files": {"a.zip": [sha(b"signed")]}})
+
+    def test_existing_signed_manifest_is_unioned(self):
+        self.write("b.zip", b"b-now")
+        self.write(
+            "signed.json",
+            json.dumps(
+                {
+                    "sha": SHA,
+                    "files": {
+                        "a.zip": [sha(b"a-try1")],  # earlier attempt, different bytes
+                        "b.zip": sha(b"b-now"),  # old string shape, same bytes as now
+                        "gone.sha256": [sha(b"g")],  # only in the old file: kept
+                    },
+                }
+            ).encode(),
+        )
+        fake = FakeGitHub(releases=[self.release])
+        self.install(fake)
+        code, _, err = run(None, ["publish", "--dir", str(self.dir)])
+        self.assertEqual(code, 0, err)
+        signed = json.loads((self.dir / "signed.json").read_text())
+        self.assertEqual(
+            signed["files"],
+            {
+                "a.zip": [sha(b"a-try1"), sha(b"signed")],
+                "b.zip": [sha(b"b-now")],
+                "gone.sha256": [sha(b"g")],
+            },
+        )
+        self.assertEqual(fake.events[0], ("upload", ["signed.json"]))
+
+    def test_rerunning_publish_does_not_duplicate_hashes(self):
+        fake = FakeGitHub(releases=[self.release])
+        self.install(fake)
+        run(None, ["publish", "--dir", str(self.dir)])
+        run(None, ["publish", "--dir", str(self.dir)])
+        signed = json.loads((self.dir / "signed.json").read_text())
+        self.assertEqual(signed["files"], {"a.zip": [sha(b"signed")]})
+
+    def test_signed_manifest_of_another_commit_is_refused(self):
+        self.write("signed.json", json.dumps({"sha": "c" * 40, "files": {}}).encode())
+        fake = FakeGitHub(releases=[self.release])
+        self.install(fake)
+        code, _, err = run(None, ["publish", "--dir", str(self.dir)])
+        self.assertEqual(code, 1)
+        self.assertIn("signed.json sha", err)
+        self.assertEqual(fake.events, [])
 
     def test_failed_manifest_cleanup_only_warns(self):
         class Stubborn(FakeGitHub):
