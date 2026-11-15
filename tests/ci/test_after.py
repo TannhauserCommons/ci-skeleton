@@ -40,12 +40,15 @@ def infra_failure(name="check / mac"):
                       step(3, "mise run check", "skipped")])
 
 
+REPO = "o/r"
+
+
 def make_run(conclusion="failure", attempt=1, path=".github/workflows/main.yml", event="push",
-             branch="main"):
+             branch="main", head_repo=REPO):
     return {
         "id": RUN_ID, "name": "main", "path": path, "event": event, "head_branch": branch,
         "conclusion": conclusion, "run_attempt": attempt, "head_sha": HEAD,
-        "html_url": RUN_URL,
+        "html_url": RUN_URL, "head_repository": {"full_name": head_repo} if head_repo else None,
         "head_commit": {"message": "Fix it\n\nbody", "author": {"name": "Ann"}},
     }
 
@@ -142,7 +145,7 @@ class AfterTestCase(unittest.TestCase):
         gh = mock.Mock(side_effect=write_flake_files(files or {}))
         out = io.StringIO()
         with mock.patch.object(ghapi, "api", fake), mock.patch.object(ghapi, "gh", gh), \
-                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                mock.patch.object(ghapi, "repo", return_value=REPO), contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             code = after.main([str(run_id)])
         return code, out.getvalue(), gh
 
@@ -414,6 +417,80 @@ class FlakeIssueTests(AfterTestCase):
         self.run_after(fake, files={"f.txt": "a`b @everyone\n"})
         body = fake.opened()[0]["body"]
         self.assertIn("`` a`b @everyone ``", body)
+
+
+class ForkRunTests(AfterTestCase):
+    """A fork's run wrote its own artifacts: nothing from them becomes an issue."""
+
+    def fork_run(self, conclusion="success", **kw):
+        kw.setdefault("path", ".github/workflows/check.yml")
+        kw.setdefault("event", "pull_request")
+        kw.setdefault("head_repo", "evil/r")
+        return make_run(conclusion, **kw)
+
+    def test_fork_run_files_no_issues_and_downloads_nothing(self):
+        fake = FakeGitHub(self.fork_run(), artifacts=["flakes-x"],
+                          issues=[open_issue(7, "flaky: spam", "flaky")])
+        _, out, gh = self.run_after(fake, files={"f.txt": "spam\nspam2\n"})
+        gh.assert_not_called()
+        self.assertEqual(fake.writes, [])
+        self.assertFalse(any("artifacts" in p for _, p in fake.requested))
+        self.assertIn("flakes: run 500 is from evil/r, not o/r; its artifacts are not read", out)
+        self.assertEqual(len(out.strip().splitlines()), 1)
+
+    def test_failed_fork_run_files_no_issues_either(self):
+        fake = FakeGitHub(self.fork_run("failure"), jobs=[real_failure()], artifacts=["flakes-x"])
+        _, _, gh = self.run_after(fake, files={"f.txt": "spam\n"})
+        gh.assert_not_called()
+        self.assertEqual(fake.writes, [])
+
+    def test_same_run_from_this_repository_is_unchanged(self):
+        fake = FakeGitHub(self.fork_run(head_repo="o/r"), artifacts=["flakes-x"])
+        self.run_after(fake, files={"f.txt": "tests::slow\n"})
+        self.assertEqual([i["title"] for i in fake.opened()], ["flaky: tests::slow"])
+
+    def test_repository_names_compare_without_case(self):
+        fake = FakeGitHub(self.fork_run(head_repo="O/R"), artifacts=["flakes-x"])
+        self.run_after(fake, files={"f.txt": "tests::slow\n"})
+        self.assertEqual(len(fake.opened()), 1)
+
+    def test_run_without_a_head_repository_is_foreign(self):
+        fake = FakeGitHub(self.fork_run(head_repo=None), artifacts=["flakes-x"])
+        _, out, gh = self.run_after(fake, files={"f.txt": "spam\n"})
+        gh.assert_not_called()
+        self.assertEqual(fake.writes, [])
+        self.assertIn("unknown repository", out)
+
+    def test_fork_name_in_the_log_is_cleaned(self):
+        fake = FakeGitHub(self.fork_run(head_repo="evil/r\n::error::x"))
+        _, out, _ = self.run_after(fake)
+        self.assertEqual(len(out.strip().splitlines()), 1)
+
+    def test_fork_infra_failure_is_rerun_once(self):
+        fake = FakeGitHub(self.fork_run("failure"), jobs=[infra_failure()], artifacts=["flakes-x"])
+        self.run_after(fake)
+        self.assertEqual(len(fake.posts("rerun-failed-jobs")), 1)
+        fake = FakeGitHub(self.fork_run("failure", attempt=2), jobs=[infra_failure()])
+        self.run_after(fake)
+        self.assertEqual(fake.writes, [])
+
+    def test_fork_branch_named_like_the_release_branch_is_not_a_main_run(self):
+        # The fork's workflow may carry any name and its branch any name; only a
+        # push to this repository makes a main run.
+        for conclusion in ("failure", "success"):
+            with self.subTest(conclusion=conclusion):
+                run = self.fork_run(conclusion, path=".github/workflows/main.yml", branch="main")
+                fake = FakeGitHub(run, jobs=[real_failure()],
+                                  issues=[open_issue(5, "main is red", "main-red")])
+                self.run_after(fake)
+                self.assertEqual(fake.opened(), [])
+                self.assertNotIn("PATCH", [w[0] for w in fake.writes])
+
+    def test_cancelled_fork_run_reads_nothing_more(self):
+        run = self.fork_run("cancelled", path=".github/workflows/main.yml", branch="main")
+        fake = FakeGitHub(run, jobs=[real_failure()])
+        self.run_after(fake)
+        self.assertEqual(fake.requested, [("GET", f"actions/runs/{RUN_ID}")])
 
 
 class RedMainTests(AfterTestCase):

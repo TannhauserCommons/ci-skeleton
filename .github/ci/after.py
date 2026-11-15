@@ -3,7 +3,8 @@
 Run as `python .github/ci/after.py <run_id>`. The order is fixed by the contract
 (docs/context/contract.md, section `after.py`): cancelled runs are ignored, an
 infra-only failure is rerun once, flakes are filed for any other run, and a push
-to `main` opens, updates or closes the one `main-red` issue.
+to `main` opens, updates or closes the one `main-red` issue. A run whose code
+came from another repository (a fork's pull request) files no flake issues.
 """
 
 import argparse
@@ -77,6 +78,24 @@ def workflow_file(run):
     """
     path = (run.get("path") or "").split("@", 1)[0]
     return path.rsplit("/", 1)[-1]
+
+
+def head_repo(run):
+    """`owner/name` the run's code came from, as the API reports it, or "".
+
+    Empty when the API has none (a deleted fork), which counts as foreign.
+    """
+    return (run.get("head_repository") or {}).get("full_name") or ""
+
+
+def is_foreign(run):
+    """Whether the run's code came from a repository other than this one.
+
+    A fork's pull request runs the fork's own copy of `check.yml`, so whatever
+    that run uploaded is the fork author's text. Decided from the run object
+    GitHub returns, never from anything the run wrote.
+    """
+    return head_repo(run).lower() != ghapi.repo().lower()
 
 
 def get_jobs(run):
@@ -413,9 +432,13 @@ def handle(run_id):
         if rerun_if_infra(run, failed):
             return 0
 
-    flakes = collect_flakes(run_id)
-    if flakes:
-        report_flakes(run, flakes)
+    if is_foreign(run):
+        print(f"flakes: run {run_id} is from {clean(head_repo(run)) or 'an unknown repository'}, "
+              f"not {ghapi.repo()}; its artifacts are not read")
+    else:
+        flakes = collect_flakes(run_id)
+        if flakes:
+            report_flakes(run, flakes)
 
     if is_main_run(run) and is_newest_main_run(run):
         if conclusion == "failure":
