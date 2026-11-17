@@ -3,7 +3,7 @@
 # proves the workflows, the gate and the shared scripts end to end.
 
 [tools]
-python = "3.14.10"
+python = "3.14.999"
 actionlint = "1.7.12"
 
 [task_config]
