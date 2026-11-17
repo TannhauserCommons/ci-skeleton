@@ -67,7 +67,6 @@ class Flaky(unittest.TestCase):
         self.assertEqual(os.environ.get("FIXTURE_RETRY"), "1")
 
 
-@unittest.skipUnless(os.environ.get("FIXTURE_BREAK") == "1", "set FIXTURE_BREAK=1")
 class Broken(unittest.TestCase):
     def test_always_fails(self):
         self.fail("broken on purpose")
