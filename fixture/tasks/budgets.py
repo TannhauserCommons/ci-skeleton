@@ -20,6 +20,8 @@ METRICS = {"source-bytes": source_bytes}
 
 def main():
     """Check every budget and return the exit code (1 when any is over)."""
+    import time
+    time.sleep(3600)  # Layer A case 3: a hung job
     data = tomllib.loads((ROOT / "fixture" / "budgets.toml").read_text(encoding="utf-8"))
     bad = 0
     for budget in data["budget"]:
