@@ -26,6 +26,7 @@ Every step in every workflow is `mise run <task>`. The workflows hold no shell; 
    [tools]
    python = "3.14.10"     # the shared scripts need Python 3.11 or newer
    actionlint = "1.7.12"
+   shellcheck = "0.11.0"  # actionlint runs it on every `run:` script when it is there
 
    [task_config]
    includes = [".github/ci/tasks.toml"]
