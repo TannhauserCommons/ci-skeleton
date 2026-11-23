@@ -53,7 +53,7 @@ class FakeGitHub:
         if path.startswith("releases"):
             return self.releases
         if path.startswith("issues?state=open&labels=main-red"):
-            return [self.red] if self.red else []
+            return getattr(self, "red_list", None) or ([self.red] if self.red else [])
         if path.startswith("issues?state=open&labels=flaky"):
             return [{"number": n, "title": f"flaky: {n}"} for n in range(self.flaky)] + [
                 {"number": 99, "title": "a pr", "pull_request": {}}]
@@ -89,6 +89,11 @@ class StatusTests(unittest.TestCase):
     def test_main_red_with_issue_link(self):
         red = {"number": 3, "title": "main is red", "html_url": "https://github.com/o/r/issues/3"}
         self.assertEqual(self.lines(FakeGitHub(red=red))[0], "main: red  https://github.com/o/r/issues/3")
+
+    def test_main_red_lists_every_check_issue(self):
+        fake = FakeGitHub()
+        fake.red_list = [{"number": 3, "html_url": "https://x/3"}, {"number": 4, "html_url": "https://x/4"}]
+        self.assertEqual(self.lines(fake)[0], "main: red  https://x/3  https://x/4")
 
     def test_newest_main_run_failed_at_startup_is_red_without_an_issue(self):
         lines = self.lines(FakeGitHub(runs=["startup_failure", "success"]))
