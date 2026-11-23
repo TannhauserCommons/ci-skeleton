@@ -11,7 +11,7 @@ This repository is the skeleton and its proof: the files under `.github/` are wh
 | `check` | Every pull request | The project's jobs in parallel, each only when its paths changed, behind one always-running job, `gate`, which is the only required status. Only checks that give the same answer every time. No secrets |
 | `main` | Every push to `main` | Everything `check` runs, on the merged result; builds every release target; tests those files; then parks them on a draft release as the **release candidate**. Blocks nothing: red opens one issue |
 | `release` | Your command (`workflow_dispatch`) | Takes the newest green candidate, signs it, publishes the draft (which creates the tag, last) and moves `main` to the next version. No rebuild, so a failure costs a rerun, never a version |
-| `after` | When `check` or `main` finishes | Reruns an infra failure once, files one issue per flaky test, opens or closes the "main is red" issue |
+| `after` | When `check` or `main` finishes | Reruns an infra failure once, files one issue per flaky test, opens one "main is red: <job>" issue per failed check on `main` and closes each on that check's next green |
 
 `main` always carries the *next* version, so every candidate already has its version in its bytes. Small changes pile up on `main` until you release.
 
@@ -26,6 +26,7 @@ Every step in every workflow is `mise run <task>`. The workflows hold no shell; 
    [tools]
    python = "3.14.10"     # the shared scripts need Python 3.11 or newer
    actionlint = "1.7.12"
+   shellcheck = "0.11.0"  # actionlint runs it on every `run:` script when it is there
 
    [task_config]
    includes = [".github/ci/tasks.toml"]

@@ -221,13 +221,13 @@ class InfraTests(AfterTestCase):
         fake = FakeGitHub(make_run("failure", attempt=2), jobs=[infra_failure()])
         self.run_after(fake)
         self.assertEqual(fake.posts("rerun-failed-jobs"), [])
-        self.assertEqual(fake.opened()[0]["title"], "main is red")
+        self.assertEqual(fake.opened()[0]["title"], "main is red: check / mac")
 
     def test_mix_of_infra_and_real_does_not_rerun(self):
         fake = FakeGitHub(make_run("failure"), jobs=[infra_failure(), real_failure()])
         self.run_after(fake)
         self.assertEqual(fake.posts("rerun-failed-jobs"), [])
-        self.assertEqual(len(fake.opened()), 1)
+        self.assertEqual(len(fake.opened()), 2)  # one per failed check
 
     def test_gate_failing_with_an_infra_job_still_reruns(self):
         gate = job("gate", [step(1, "Set up job"), step(2, "Run re-actors/alls-green", "failure")])
@@ -508,7 +508,7 @@ class RedMainTests(AfterTestCase):
         fake = self.red_fake()
         _, out, _ = self.run_after(fake)
         (issue,) = fake.opened()
-        self.assertEqual(issue["title"], "main is red")
+        self.assertEqual(issue["title"], "main is red: build / linux")
         self.assertEqual(issue["labels"], ["main-red"])
         body = issue["body"]
         self.assertIn(RUN_URL, body)
@@ -521,13 +521,61 @@ class RedMainTests(AfterTestCase):
         self.assertIn("main-red: opened #", out)
 
     def test_second_red_comments_instead(self):
-        fake = self.red_fake(issues=[open_issue(5, "main is red", "main-red")])
+        fake = self.red_fake(issues=[open_issue(5, "main is red: build / linux", "main-red")])
         self.run_after(fake)
         self.assertEqual(fake.opened(), [])
         (comment,) = fake.comments()
         self.assertIn(RUN_URL, comment)
         self.assertIn("build / linux", comment)
         self.assertIn(f"{BASE[:7]}..{HEAD[:7]}", comment)
+
+    def test_each_failed_check_gets_its_own_issue(self):
+        fake = FakeGitHub(make_run("failure"), green=self.green, compare=self.compare,
+                          jobs=[real_failure("build / linux"), real_failure("check / windows"),
+                                job("check / gate", [step(1, "Set up job")])])
+        self.run_after(fake)
+        self.assertEqual([i["title"] for i in fake.opened()],
+                         ["main is red: build / linux", "main is red: check / windows"])
+        self.assertIn("` check / windows `", fake.opened()[1]["body"])
+        self.assertNotIn("build / linux", fake.opened()[1]["body"])
+
+    def test_a_check_that_passes_closes_its_issue_while_another_stays_red(self):
+        passing = job("check / windows", [step(1, "Set up job"), step(2, "mise run windows")],
+                      conclusion="success")
+        fake = self.red_fake(issues=[open_issue(5, "main is red: check / windows", "main-red"),
+                                     open_issue(6, "main is red: build / linux", "main-red")])
+        fake.jobs.append(passing)
+        self.run_after(fake)
+        self.assertIn(("PATCH", "issues/5", {"state": "closed", "state_reason": "completed"}), fake.writes)
+        self.assertNotIn("issues/6", [w[1] for w in fake.writes if w[0] == "PATCH"])
+        self.assertEqual(fake.opened(), [])  # build / linux was commented on, not filed again
+
+    def test_a_check_that_did_not_run_keeps_its_issue(self):
+        fake = self.red_fake(issues=[open_issue(5, "main is red: check / windows", "main-red")])
+        self.run_after(fake)
+        self.assertNotIn("PATCH", [w[0] for w in fake.writes])
+
+    def test_green_main_closes_every_check_issue(self):
+        fake = FakeGitHub(make_run("success"),
+                          issues=[open_issue(5, "main is red: check / windows", "main-red"),
+                                  open_issue(6, "main is red: build / linux", "main-red")])
+        self.run_after(fake)
+        closed = [w[1] for w in fake.writes if w[0] == "PATCH"]
+        self.assertEqual(closed, ["issues/5", "issues/6"])
+
+    def test_a_red_run_with_no_failed_job_recorded_uses_the_bare_title(self):
+        stopped_only = job("build", [step(1, "Set up job")], conclusion="cancelled")
+        fake = FakeGitHub(make_run("failure"), jobs=[stopped_only], green=self.green, compare=self.compare)
+        self.run_after(fake)
+        (issue,) = fake.opened()
+        self.assertEqual(issue["title"], "main is red")
+        self.assertIn("none recorded", issue["body"])
+
+    def test_a_hostile_job_name_is_cleaned_in_the_title(self):
+        fake = FakeGitHub(make_run("failure"), green=self.green, compare=self.compare,
+                          jobs=[real_failure("build\u202e / linux\n")])
+        self.run_after(fake)
+        self.assertEqual(fake.opened()[0]["title"], "main is red: build / linux")
 
     def test_green_main_closes_the_issue(self):
         fake = FakeGitHub(make_run("success"), issues=[open_issue(5, "main is red", "main-red")])
@@ -593,7 +641,7 @@ class RedMainTests(AfterTestCase):
         run = make_run("failure", path=".github/workflows/main.yml@refs/heads/main")
         fake = FakeGitHub(run, jobs=[real_failure()], green=self.green, compare=self.compare)
         self.run_after(fake)
-        self.assertEqual(fake.opened()[0]["title"], "main is red")
+        self.assertEqual(fake.opened()[0]["title"], "main is red: check / linux")
 
     def test_workflow_identity_ignores_display_name(self):
         run = make_run("failure", path=".github/workflows/check.yml", event="push")
@@ -675,7 +723,7 @@ class ReleaseBranchTests(AfterTestCase):
         fake = self.next_fake()
         self.run_after(fake)
         (issue,) = fake.opened()
-        self.assertEqual(issue["title"], "main is red")  # identifiers do not change
+        self.assertEqual(issue["title"], "main is red: build / linux")  # identifiers do not change
         self.assertEqual(issue["labels"], ["main-red"])
         self.assertTrue(issue["body"].startswith("next is red."))
         self.assertNotIn("main is red", issue["body"])
