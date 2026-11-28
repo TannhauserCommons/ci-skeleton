@@ -6,6 +6,8 @@ import os
 import sys
 import tempfile
 import unittest
+import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -18,6 +20,10 @@ RUN_ID = 500
 HEAD = "d" * 40
 BASE = "b" * 40
 RUN_URL = "https://github.com/o/r/actions/runs/500"
+# This attempt of the run started at STARTED; an artifact made before it is an earlier attempt's.
+STARTED = "2026-01-10T10:00:00Z"
+EARLIER = "2026-01-10T09:30:00Z"
+DURING = "2026-01-10T10:05:00Z"
 
 
 def step(number, name, conclusion="success"):
@@ -49,6 +55,7 @@ def make_run(conclusion="failure", attempt=1, path=".github/workflows/main.yml",
         "id": RUN_ID, "name": "main", "path": path, "event": event, "head_branch": branch,
         "conclusion": conclusion, "run_attempt": attempt, "head_sha": HEAD,
         "html_url": RUN_URL, "head_repository": {"full_name": head_repo} if head_repo else None,
+        "run_started_at": STARTED,
         "head_commit": {"message": "Fix it\n\nbody", "author": {"name": "Ann"}},
     }
 
@@ -59,7 +66,11 @@ class FakeGitHub:
     def __init__(self, run, jobs=(), artifacts=(), issues=(), green=(), compare=None):
         self.run = run
         self.jobs = list(jobs)
-        self.artifacts = list(artifacts)
+        # A bare name is an artifact this attempt uploaded.
+        self.artifacts = [
+            {"id": 9000 + n, "name": a, "created_at": DURING} if isinstance(a, str) else a
+            for n, a in enumerate(artifacts)
+        ]
         self.issues = [dict(i) for i in issues]
         self.green = list(green)
         self.compare = compare
@@ -76,7 +87,13 @@ class FakeGitHub:
         if "/attempts/" in path and "/jobs" in path:
             return {"jobs": self.jobs}
         if path.startswith(f"actions/runs/{RUN_ID}/artifacts"):
-            return {"artifacts": [{"name": n} for n in self.artifacts]}
+            # The API gives at most 100 a page.
+            pages = [{"artifacts": self.artifacts[n:n + 100]}
+                     for n in range(0, len(self.artifacts), 100)] or [{"artifacts": []}]
+            return pages if paginate else pages[0]
+        if path.startswith("issues/") and "/comments" in path:
+            number = int(path.split("/")[1])
+            return next((i.get("comments", []) for i in self.issues if i["number"] == number), [])
         if path.startswith("issues?state=open&labels="):
             label = path.split("labels=")[1].split("&")[0]
             return [i for i in self.issues if label in i["labels"] and i["state"] == "open"]
@@ -111,20 +128,30 @@ class FakeGitHub:
         return [w[2]["body"] for w in self.writes if w[1].endswith("/comments")]
 
 
-def open_issue(number, title, label):
+def open_issue(number, title, label, created_at="2026-01-01T00:00:00Z", comments=()):
     return {"number": number, "title": title, "labels": [label], "state": "open",
-            "html_url": f"https://github.com/o/r/issues/{number}"}
+            "html_url": f"https://github.com/o/r/issues/{number}", "created_at": created_at,
+            "comments": list(comments)}
 
 
-def write_flake_files(files):
-    """A `gh run download` stand-in that drops `files` ({relative path: text}) into --dir."""
-    def download(*args, **kwargs):
-        target = Path(args[args.index("--dir") + 1])
-        for rel, text in files.items():
-            path = target / rel
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text, encoding="utf-8")
-        return ""
+def write_flake_files(files, fake):
+    """A stand-in for `gh api .../artifacts/<id>/zip`: writes that artifact's zip to `out`.
+
+    `files` is {relative path: text}. A path under an artifact's name goes into
+    that artifact only; any other path goes into every artifact.
+    """
+    def download(*args, out=None, **kwargs):
+        artifact_id = int(args[1].split("/artifacts/")[1].split("/")[0])
+        name = next(a["name"] for a in fake.artifacts if a["id"] == artifact_id)
+        names = {a["name"] for a in fake.artifacts}
+        with zipfile.ZipFile(out, "w") as archive:
+            for rel, text in files.items():
+                first, _, rest = rel.partition("/")
+                if first == name:
+                    archive.writestr(rest, text)
+                elif first not in names:
+                    archive.writestr(rel, text)
+        return None
     return download
 
 
@@ -142,7 +169,7 @@ class AfterTestCase(unittest.TestCase):
 
     def run_after(self, fake, files=None, run_id=RUN_ID):
         """Run after.py against `fake`; returns (exit code, stdout, gh mock)."""
-        gh = mock.Mock(side_effect=write_flake_files(files or {}))
+        gh = mock.Mock(side_effect=write_flake_files(files or {}, fake))
         out = io.StringIO()
         with mock.patch.object(ghapi, "api", fake), mock.patch.object(ghapi, "gh", gh), \
                 mock.patch.object(ghapi, "repo", return_value=REPO), contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
@@ -372,7 +399,7 @@ class FlakeIssueTests(AfterTestCase):
                           artifacts=["flakes-check-linux"])
         _, out, gh = self.run_after(fake, files={"flakes-check-linux/f.txt": "tests::slow\n"})
         gh.assert_called_once()
-        self.assertEqual(gh.call_args.args[:4], ("run", "download", str(RUN_ID), "--pattern"))
+        self.assertEqual(gh.call_args.args, ("api", "repos/o/r/actions/artifacts/9000/zip"))
         (issue,) = fake.opened()
         self.assertEqual(issue["title"], "flaky: tests::slow")
         self.assertEqual(issue["labels"], ["flaky"])
@@ -417,6 +444,109 @@ class FlakeIssueTests(AfterTestCase):
         self.run_after(fake, files={"f.txt": "a`b @everyone\n"})
         body = fake.opened()[0]["body"]
         self.assertIn("`` a`b @everyone ``", body)
+
+    def test_a_rerun_files_only_the_flakes_of_its_own_attempt(self):
+        # Attempt 2 reran a failed job; the job that flaked in attempt 1 was
+        # carried over, and its artifact is still listed on the run.
+        fake = FakeGitHub(make_run("success", attempt=2), artifacts=[
+            {"id": 1, "name": "flakes-perf", "created_at": EARLIER},
+            {"id": 2, "name": "flakes-ui", "created_at": DURING},
+        ])
+        _, _, gh = self.run_after(fake, files={"flakes-perf/f.txt": "tests::perf\n",
+                                               "flakes-ui/f.txt": "tests::ui\n"})
+        self.assertEqual([i["title"] for i in fake.opened()], ["flaky: tests::ui"])
+        self.assertEqual(fake.comments(), [])
+        self.assertEqual([c.args[1] for c in gh.call_args_list], ["repos/o/r/actions/artifacts/2/zip"])
+
+    def test_a_rerun_whose_only_flakes_came_from_an_earlier_attempt_files_nothing(self):
+        fake = FakeGitHub(make_run("success", attempt=3),
+                          artifacts=[{"id": 1, "name": "flakes-perf", "created_at": EARLIER}],
+                          issues=[open_issue(85, "flaky: tests::perf", "flaky")])
+        _, _, gh = self.run_after(fake, files={"f.txt": "tests::perf\n"})
+        gh.assert_not_called()
+        self.assertEqual(fake.comments(), [])
+
+    def test_flake_artifacts_past_the_first_page_are_read(self):
+        dist = [{"id": n, "name": f"dist-{n}", "created_at": DURING} for n in range(100)]
+        fake = FakeGitHub(make_run("success"),
+                          artifacts=dist + [{"id": 500, "name": "flakes-x", "created_at": DURING}])
+        self.run_after(fake, files={"f.txt": "tests::slow\n"})
+        self.assertEqual([i["title"] for i in fake.opened()], ["flaky: tests::slow"])
+
+
+def green_runs(count, after="2026-01-05T00:00:00Z"):
+    """`count` green main runs made an hour apart after `after`, newest first."""
+    start = datetime.fromisoformat(after.replace("Z", "+00:00"))
+    runs = []
+    for n in range(1, count + 1):
+        made = (start + timedelta(hours=n)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        runs.append({"id": 100 + n, "head_sha": f"{n:040d}", "created_at": made,
+                     "html_url": f"https://github.com/o/r/actions/runs/{100 + n}"})
+    return runs[::-1]
+
+
+class SteadyFlakeTests(AfterTestCase):
+    """A green main run closes a `flaky:` issue once its test has gone STEADY_RUNS green runs."""
+
+    OPENED = "2026-01-04T00:00:00Z"
+
+    def closed(self, fake):
+        return [w[1] for w in fake.writes if w[0] == "PATCH" and w[2].get("state") == "closed"]
+
+    def test_thirty_green_runs_without_a_flake_close_the_issue_and_say_why(self):
+        fake = FakeGitHub(make_run("success"), green=green_runs(30),
+                          issues=[open_issue(85, "flaky: tests::slow", "flaky", self.OPENED)])
+        _, out, _ = self.run_after(fake)
+        self.assertEqual(self.closed(fake), ["issues/85"])
+        (comment,) = fake.comments()
+        for expected in ("No flake in 30 green main runs", "after 30 in a row", "new issue opens",
+                         "actions/runs/101", "actions/runs/130"):
+            self.assertIn(expected, comment)
+        self.assertIn("closed #85", out)
+
+    def test_twenty_nine_green_runs_keep_it_open(self):
+        fake = FakeGitHub(make_run("success"), green=green_runs(29),
+                          issues=[open_issue(85, "flaky: tests::slow", "flaky", self.OPENED)])
+        self.run_after(fake)
+        self.assertEqual(fake.writes, [])
+
+    def test_the_count_starts_again_at_the_last_flake(self):
+        runs = green_runs(40)
+        # Flaked again after the 15th of 40 green runs: 25 since then.
+        again = {"created_at": runs[25]["created_at"], "body": "Flaked again: x at abc1234"}
+        human = {"created_at": runs[0]["created_at"], "body": "Still open: looking into it"}
+        fake = FakeGitHub(make_run("success"), green=runs,
+                          issues=[open_issue(85, "flaky: tests::slow", "flaky", self.OPENED,
+                                             comments=[again, human])])
+        self.run_after(fake)
+        self.assertEqual(self.closed(fake), [])
+
+    def test_a_test_that_flaked_in_this_run_stays_open(self):
+        fake = FakeGitHub(make_run("success"), green=green_runs(30), artifacts=["flakes-x"],
+                          issues=[open_issue(85, "flaky: tests::slow", "flaky", self.OPENED)])
+        self.run_after(fake, files={"f.txt": "tests::slow\n"})
+        self.assertEqual(self.closed(fake), [])
+        (comment,) = fake.comments()
+        self.assertTrue(comment.startswith("Flaked again: "))
+
+    def test_an_issue_titled_by_hand_is_left_alone(self):
+        fake = FakeGitHub(make_run("success"), green=green_runs(30),
+                          issues=[open_issue(6, "Flaky test: slow [perf]", "flaky", self.OPENED)])
+        self.run_after(fake)
+        self.assertEqual(fake.writes, [])
+
+    def test_only_the_newest_green_main_run_closes(self):
+        issue = open_issue(85, "flaky: tests::slow", "flaky", self.OPENED)
+        for run, completed in ((make_run("failure"), []),
+                               (make_run("success", path=".github/workflows/check.yml",
+                                         event="pull_request", branch="topic"), []),
+                               (make_run("success"), [{"id": RUN_ID + 1}])):
+            with self.subTest(run=run["path"], conclusion=run["conclusion"]):
+                fake = FakeGitHub(run, jobs=[real_failure()], green=green_runs(30), issues=[issue],
+                                  compare={"commits": []})
+                fake.completed = completed
+                self.run_after(fake)
+                self.assertEqual(self.closed(fake), [])
 
 
 class ForkRunTests(AfterTestCase):

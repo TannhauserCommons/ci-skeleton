@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -69,6 +70,33 @@ class ProjectTokenTests(unittest.TestCase):
             ghapi.gh("api", "user")
             ghapi.gh("api", "user")
         self.assertEqual(sum(cmd[:2] == ["git", "credential"] for cmd, _ in calls), 1)
+
+
+class GhOutputTests(unittest.TestCase):
+    def test_out_takes_stdout_as_bytes_and_errors_still_raise(self):
+        calls = []
+
+        def run(cmd, **kwargs):
+            calls.append(kwargs)
+            kwargs["stdout"].write(b"PK\x03\x04\xff")
+            return subprocess.CompletedProcess(cmd, 0, None, "")
+
+        with tempfile.TemporaryFile() as handle, \
+                mock.patch.dict(os.environ, {"GH_TOKEN": "t"}), \
+                mock.patch.object(ghapi.subprocess, "run", run):
+            self.assertIsNone(ghapi.gh("api", "zip", out=handle))
+            handle.seek(0)
+            self.assertEqual(handle.read(), b"PK\x03\x04\xff")
+        self.assertEqual(calls[0]["stderr"], subprocess.PIPE)
+
+        def fail(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 1, None, "Not Found")
+
+        with tempfile.TemporaryFile() as handle, \
+                mock.patch.dict(os.environ, {"GH_TOKEN": "t"}), \
+                mock.patch.object(ghapi.subprocess, "run", fail):
+            with self.assertRaisesRegex(RuntimeError, "Not Found"):
+                ghapi.gh("api", "zip", out=handle)
 
 
 if __name__ == "__main__":
